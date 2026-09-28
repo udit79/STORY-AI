@@ -13,6 +13,7 @@ dependencies = [
     "pyclipper>=1.4.0",
     "pydantic>=2.13.5",
     "pytest>=9.1.1",
+    "rapidfuzz>=3.14.6",
     "ruff>=0.16.9",
     "setuptools<81",
     "shapely>=2.1.2",
