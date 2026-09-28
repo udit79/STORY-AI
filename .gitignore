@@ -1,3 +1,11 @@
 .venv
 .*cache
 outputs/
+.conda/
+__pycache__/
+*.py[cod]
+*$py.class
+.uv/
+.cuda/
+downloads/
+.venv-nemotron/
