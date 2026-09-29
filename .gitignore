@@ -9,3 +9,4 @@ __pycache__/
 .cuda/
 downloads/
 .venv-nemotron/
+.torch/
