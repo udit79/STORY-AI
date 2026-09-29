@@ -129,11 +129,11 @@ def test_duplicate_panel_and_balloon_proposals_are_suppressed_or_merged():
             return [PanelProposal(bbox=bbox), PanelProposal(bbox=bbox)]
 
     class Balloons:
-        def propose_balloons(self, image_path, regions, panels):
+        def propose_balloons(self, image_path, page_width, page_height):
             bbox = BoundingBox(x1=15, y1=15, x2=50, y2=60)
             return [
-                BalloonProposal(bbox=bbox, text_region_ids=[first.id]),
-                BalloonProposal(bbox=bbox, text_region_ids=[second.id]),
+                BalloonProposal(bbox=bbox),
+                BalloonProposal(bbox=bbox),
             ]
 
     result = group(
@@ -207,8 +207,11 @@ def test_visual_grouping_provider_can_resolve_ambiguous_geometry():
     second = make_region("ctd-near-b", 50, 20, 70, 40)
 
     class VisualGrouper:
-        def resolve_ambiguous(self, image_path, regions, candidate_region_ids, panels):
+        def resolve_ambiguous(
+            self, image_path, regions, candidate_region_ids, candidate_balloon_ids, panels
+        ):
             assert set(candidate_region_ids) == {first.id, second.id}
+            assert candidate_balloon_ids == {}
             return [VisualGroupingProposal(
                 text_region_ids=[first.id, second.id],
                 confidence=0.82,
@@ -274,26 +277,69 @@ def test_malformed_region_bbox_is_preserved_but_unassigned():
     assert result.decisions[0].evidence["reason"] == "malformed_text_region_bbox"
 
 
-def test_conflicting_explicit_balloon_membership_remains_ambiguous():
+def test_competing_balloon_bbox_ownership_remains_ambiguous():
     first = make_region("ctd-conflict", 20, 20, 40, 35)
     second = make_region("ctd-neighbor", 20, 38, 40, 53)
 
     class Balloons:
-        def propose_balloons(self, image_path, regions, panels):
+        def propose_balloons(self, image_path, page_width, page_height):
             return [
                 BalloonProposal(
-                    bbox=BoundingBox(x1=15, y1=15, x2=45, y2=40),
-                    text_region_ids=[first.id],
+                    bbox=BoundingBox(x1=15, y1=15, x2=45, y2=35),
                 ),
                 BalloonProposal(
-                    bbox=BoundingBox(x1=15, y1=25, x2=45, y2=55),
-                    text_region_ids=[first.id],
+                    bbox=BoundingBox(x1=15, y1=20, x2=45, y2=40),
                 ),
             ]
 
     result = group(make_page(first, second), PageLayoutGrouper(balloon_provider=Balloons()))
 
-    assert all(first.id not in balloon.text_region_ids for balloon in result.page.balloons)
-    first_decisions = [decision for decision in result.decisions if first.id in decision.text_region_ids]
-    assert len(first_decisions) == 1
-    assert first_decisions[0].status == "ambiguous"
+    assert result.page.balloons == []
+    first_decision = next(
+        decision for decision in result.decisions if decision.text_region_ids == [first.id]
+    )
+    assert first_decision.status == "ambiguous"
+    assert len(first_decision.candidate_balloon_ids) == 2
+
+
+def test_visual_provider_can_choose_between_competing_balloon_proposals():
+    region = make_region("ctd-visual-choice", 40, 20, 60, 35)
+
+    class Balloons:
+        def propose_balloons(self, image_path, page_width, page_height):
+            return [
+                BalloonProposal(bbox=BoundingBox(x1=30, y1=10, x2=60, y2=45)),
+                BalloonProposal(bbox=BoundingBox(x1=40, y1=10, x2=70, y2=45)),
+            ]
+
+    class VisualGrouper:
+        def resolve_ambiguous(
+            self, image_path, regions, candidate_region_ids, candidate_balloon_ids, panels
+        ):
+            assert candidate_balloon_ids == {
+                region.id: [
+                    "balloon-layout-sequence-test-p00-0001",
+                    "balloon-layout-sequence-test-p00-0002",
+                ]
+            }
+            return [
+                VisualGroupingProposal(
+                    text_region_ids=[region.id],
+                    confidence=0.9,
+                    target_balloon_id="balloon-layout-sequence-test-p00-0001",
+                    evidence={"visual_pick": "left balloon"},
+                )
+            ]
+
+    result = group(
+        make_page(region),
+        PageLayoutGrouper(
+            balloon_provider=Balloons(),
+            visual_grouping_provider=VisualGrouper(),
+        ),
+    )
+
+    assert len(result.page.balloons) == 1
+    assert result.page.balloons[0].id == "balloon-layout-sequence-test-p00-0001"
+    assert result.page.balloons[0].text_region_ids == [region.id]
+    assert result.decisions[0].status == "assigned"

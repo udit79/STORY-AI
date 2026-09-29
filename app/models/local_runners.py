@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -38,27 +38,32 @@ def load_paddle_recognizer(
 
 
 class Qwen3VLLocalRunner:
-    """Localized-crop Qwen3-VL inference using explicitly loaded local weights."""
+    """Reuse one explicitly loaded Qwen3-VL model across crop/proposal calls."""
 
     def __init__(self, model: Any, processor: Any, max_new_tokens: int = 256) -> None:
         self.model = model
         self.processor = processor
         self.max_new_tokens = max_new_tokens
 
-    def __call__(self, image_path: Path) -> dict[str, Any]:
+    def generate_json(
+        self,
+        image_paths: Sequence[str | Path],
+        prompt: str,
+    ) -> dict[str, Any]:
+        """Run a caller-supplied prompt over ordered local images and parse JSON."""
         import torch
         from qwen_vl_utils import process_vision_info
 
-        prompt = """You are given ONE localized manga text block.
-Read only text visible inside this crop. Do not infer from the page or invent text.
-Return JSON with transcription, candidate_supported, visual_confidence, text_type,
-and notes. Use text_type dialogue, thought, narration, vocalisation, sound_effect,
-or unknown. Preserve visible wording and punctuation."""
+        if not image_paths:
+            raise ValueError("at least one local image is required for Qwen inference")
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": image_path.resolve().as_posix()},
+                    *(
+                        {"type": "image", "image": Path(image_path).resolve().as_posix()}
+                        for image_path in image_paths
+                    ),
                     {"type": "text", "text": prompt},
                 ],
             }
@@ -99,23 +104,42 @@ or unknown. Preserve visible wording and punctuation."""
         try:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError:
-            parsed = {
-                "transcription": cleaned,
-                "candidate_supported": None,
-                "visual_confidence": None,
-                "text_type": "unknown",
-                "notes": "Qwen output was not valid JSON.",
+            return {
+                "_raw_output": raw_output,
+                "_json_parse_error": "Qwen output was not valid JSON.",
             }
         if not isinstance(parsed, Mapping):
             return {
-                "transcription": "",
+                "_raw_output": raw_output,
+                "_json_parse_error": "Qwen JSON output was not an object.",
+            }
+        return {**parsed, "_raw_output": raw_output}
+
+    def __call__(self, image_path: Path) -> dict[str, Any]:
+        prompt = """You are given ONE localized manga text block.
+Read only text visible inside this crop. Do not infer from the page or invent text.
+Return JSON with transcription, candidate_supported, visual_confidence, text_type,
+and notes. Use text_type dialogue, thought, narration, vocalisation, sound_effect,
+or unknown. Preserve visible wording and punctuation."""
+        parsed = self.generate_json([image_path], prompt)
+        if "_json_parse_error" in parsed:
+            raw_output = str(parsed.get("_raw_output", "")).strip()
+            return {
+                "transcription": raw_output,
                 "candidate_supported": None,
                 "visual_confidence": None,
                 "text_type": "unknown",
-                "notes": "Qwen JSON output was not an object.",
+                "notes": str(parsed["_json_parse_error"]),
                 "raw_output": raw_output,
             }
-        return {**parsed, "raw_output": raw_output}
+        return {
+            **parsed,
+            "transcription": str(parsed.get("transcription", "") or "").strip(),
+            "candidate_supported": parsed.get("candidate_supported"),
+            "visual_confidence": parsed.get("visual_confidence"),
+            "text_type": parsed.get("text_type", "unknown"),
+            "raw_output": parsed.get("_raw_output", ""),
+        }
 
 
 def load_qwen3vl_runner(

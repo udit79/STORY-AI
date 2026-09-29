@@ -17,7 +17,14 @@ from urllib.parse import quote
 import cv2
 from pydantic import BaseModel, Field
 
-from app.schemas.page import Balloon, BoundingBox, PageRepresentation, Panel, TextRegion
+from app.schemas.page import (
+    Balloon,
+    BoundingBox,
+    PageRepresentation,
+    Panel,
+    Point2D,
+    TextRegion,
+)
 
 GroupingMethod = Literal[
     "layout_model",
@@ -34,9 +41,8 @@ class PanelProposal(BaseModel):
 
 
 class BalloonProposal(BaseModel):
-    bbox: BoundingBox | None = None
-    text_region_ids: list[str] = Field(default_factory=list)
-    panel_id: str | None = None
+    bbox: BoundingBox
+    mask_polygon: list[Point2D] | None = None
     kind: Literal["speech", "thought", "narration", "unknown"] = "unknown"
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     evidence: dict[str, Any] = Field(default_factory=dict)
@@ -45,6 +51,7 @@ class BalloonProposal(BaseModel):
 class VisualGroupingProposal(BaseModel):
     text_region_ids: list[str] = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
+    target_balloon_id: str | None = None
     evidence: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -68,6 +75,8 @@ class LayoutGroupingResult(BaseModel):
     page: PageRepresentation
     decisions: list[GroupingDecision]
     unassigned_text_region_ids: list[str]
+    panel_proposal_count: int = 0
+    balloon_proposal_count: int = 0
     diagnostics: list[LayoutDiagnostic] = Field(default_factory=list)
 
 
@@ -84,8 +93,8 @@ class BalloonLayoutProvider(Protocol):
     def propose_balloons(
         self,
         image_path: Path,
-        regions: Sequence[TextRegion],
-        panels: Sequence[Panel],
+        page_width: int,
+        page_height: int,
     ) -> Sequence[BalloonProposal]: ...
 
 
@@ -95,6 +104,7 @@ class VisualGroupingProvider(Protocol):
         image_path: Path,
         regions: Sequence[TextRegion],
         candidate_region_ids: Sequence[str],
+        candidate_balloon_ids: Mapping[str, Sequence[str]],
         panels: Sequence[Panel],
     ) -> Sequence[VisualGroupingProposal]: ...
 
@@ -113,6 +123,8 @@ class _BalloonGroup(BaseModel):
     panel_id: str | None
     confidence: float | None
     method: GroupingMethod
+    balloon_id: str | None = None
+    mask_polygon: list[Point2D] | None = None
     kind: Literal["speech", "thought", "narration", "unknown"] = "unknown"
     evidence: dict[str, Any] = Field(default_factory=dict)
 
@@ -253,20 +265,41 @@ class PageLayoutGrouper:
         decisions: list[GroupingDecision] = []
         explicitly_claimed: set[str] = set()
         explicitly_ambiguous: set[str] = set()
+        explicit_ambiguity: dict[str, tuple[list[str], dict[str, Any]]] = {}
+        layout_provider_succeeded = False
+        balloon_proposal_count = 0
 
         if self.balloon_provider is not None:
-            explicit_groups, claimed, ambiguous = self._layout_groups(
-                source_path, page.text_regions, panels, memberships, diagnostics,
+            (
+                explicit_groups,
+                claimed,
+                ambiguous,
+                layout_provider_succeeded,
+                balloon_proposal_count,
+            ) = self._layout_groups(
+                source_path,
+                width,
+                height,
+                page.text_regions,
+                panels,
+                memberships,
+                sequence_id,
+                page.page_index,
+                diagnostics,
             )
             groups.extend(explicit_groups)
             explicitly_claimed.update(claimed)
+            explicit_ambiguity.update(ambiguous)
             explicitly_ambiguous.update(ambiguous)
 
-        geometry_groups, weak_regions, relation_evidence = self._geometry_groups(
-            page.text_regions,
-            memberships,
-            explicitly_claimed | explicitly_ambiguous,
-        )
+        if layout_provider_succeeded:
+            geometry_groups, weak_regions, relation_evidence = [], set(), {}
+        else:
+            geometry_groups, weak_regions, relation_evidence = self._geometry_groups(
+                page.text_regions,
+                memberships,
+                explicitly_claimed | explicitly_ambiguous,
+            )
         groups.extend(geometry_groups)
 
         unresolved = {
@@ -277,15 +310,17 @@ class PageLayoutGrouper:
             and all(region.id not in group.region_ids for group in geometry_groups)
         }
         unresolved.update(explicitly_ambiguous)
-        ambiguous_region_ids = sorted(unresolved & weak_regions)
+        ambiguous_region_ids = sorted((unresolved & weak_regions) | set(explicit_ambiguity))
         visual_groups: list[_BalloonGroup] = []
         if ambiguous_region_ids and self.visual_grouping_provider is not None:
-            visual_groups = self._visual_groups(
+            visual_groups, _ = self._visual_groups(
                 source_path,
                 page.text_regions,
                 panels,
                 memberships,
                 ambiguous_region_ids,
+                explicit_ambiguity,
+                groups,
                 sequence_id,
                 page.page_index,
                 diagnostics,
@@ -308,7 +343,29 @@ class PageLayoutGrouper:
                     )
                 )
                 continue
+            if layout_provider_succeeded and region.id not in explicit_ambiguity:
+                decisions.append(
+                    GroupingDecision(
+                        text_region_ids=[region.id],
+                        method="layout_model",
+                        status="unassigned",
+                        evidence={"reason": "no_balloon_proposal_overlap"},
+                    )
+                )
+                continue
             if region.id in ambiguous_region_ids or region.id in explicitly_ambiguous:
+                if region.id in explicit_ambiguity:
+                    candidate_balloon_ids, evidence = explicit_ambiguity[region.id]
+                    decisions.append(
+                        GroupingDecision(
+                            text_region_ids=[region.id],
+                            method="layout_model",
+                            status="ambiguous",
+                            candidate_balloon_ids=candidate_balloon_ids,
+                            evidence=evidence,
+                        )
+                    )
+                    continue
                 possible = [
                     other_id
                     for other_id in relation_evidence.get(region.id, {})
@@ -378,6 +435,8 @@ class PageLayoutGrouper:
             page=grouped_page,
             decisions=decisions,
             unassigned_text_region_ids=list(dict.fromkeys(unassigned)),
+            panel_proposal_count=sum(panel.source == "layout_model" for panel in panels),
+            balloon_proposal_count=balloon_proposal_count,
             diagnostics=diagnostics,
         )
 
@@ -557,15 +616,25 @@ class PageLayoutGrouper:
     def _layout_groups(
         self,
         image_path: Path,
+        page_width: int,
+        page_height: int,
         regions: Sequence[TextRegion],
         panels: Sequence[Panel],
         memberships: Mapping[str, _RegionMembership],
+        sequence_id: str,
+        page_index: int,
         diagnostics: list[LayoutDiagnostic],
-    ) -> tuple[list[_BalloonGroup], set[str], set[str]]:
+    ) -> tuple[
+        list[_BalloonGroup],
+        set[str],
+        dict[str, tuple[list[str], dict[str, Any]]],
+        bool,
+        int,
+    ]:
         assert self.balloon_provider is not None
         try:
             raw_proposals = self.balloon_provider.propose_balloons(
-                image_path, regions, panels
+                image_path, page_width, page_height
             )
             proposals = [_as_balloon_proposal(raw) for raw in raw_proposals]
         except Exception as exc:  # noqa: BLE001 - geometry grouping remains available
@@ -576,122 +645,112 @@ class PageLayoutGrouper:
                     message=str(exc),
                 )
             )
-            return [], set(), set()
+            return [], set(), {}, False, 0
 
-        region_by_id = {region.id: region for region in regions}
         normalized: list[BalloonProposal] = []
         for proposal in proposals:
-            unknown = set(proposal.text_region_ids) - set(region_by_id)
-            if unknown:
+            if not _valid_bbox(proposal.bbox):
                 diagnostics.append(
                     LayoutDiagnostic(
                         component="balloon_layout_provider",
-                        error_type="UnknownRegionReference",
-                        message=f"Ignored unknown CTD IDs: {sorted(unknown)}",
-                    )
-                )
-            region_ids = [
-                region_id for region_id in proposal.text_region_ids
-                if region_id in region_by_id
-            ]
-            if not region_ids and proposal.bbox is not None and _valid_bbox(proposal.bbox):
-                region_ids = [
-                    region.id for region in regions
-                    if _valid_bbox(region.bbox)
-                    and (
-                        _contains(proposal.bbox, region.bbox)
-                        or _intersection_area(proposal.bbox, region.bbox) / _area(region.bbox) >= 0.8
-                    )
-                ]
-            if proposal.bbox is None and region_ids:
-                proposal = proposal.model_copy(update={
-                    "bbox": _union_bbox([region_by_id[region_id].bbox for region_id in region_ids])
-                })
-            if not region_ids or proposal.bbox is None or not _valid_bbox(proposal.bbox):
-                diagnostics.append(
-                    LayoutDiagnostic(
-                        component="balloon_layout_provider",
-                        error_type="InvalidBalloonProposal",
-                        message="Discarded proposal without valid bbox or CTD membership.",
+                        error_type="InvalidBalloonBBox",
+                        message="Discarded balloon proposal with malformed bbox.",
                     )
                 )
                 continue
-            normalized_proposal = proposal.model_copy(update={"text_region_ids": region_ids})
-            duplicate_index = next((
-                index for index, previous in enumerate(normalized)
-                if previous.bbox is not None
-                and normalized_proposal.bbox is not None
-                and _iou(previous.bbox, normalized_proposal.bbox) >= self.duplicate_iou_threshold
-            ), None)
-            if duplicate_index is None:
-                normalized.append(normalized_proposal)
-            else:
-                previous = normalized[duplicate_index]
-                merged_ids = list(dict.fromkeys(previous.text_region_ids + region_ids))
-                normalized[duplicate_index] = previous.model_copy(update={
-                    "text_region_ids": merged_ids,
-                    "confidence": max(
-                        value for value in (previous.confidence, normalized_proposal.confidence)
-                        if value is not None
-                    ) if previous.confidence is not None or normalized_proposal.confidence is not None else None,
-                    "evidence": {
-                        **previous.evidence,
-                        "duplicate_layout_proposal_merged": True,
-                    },
-                })
+            normalized.append(proposal)
 
-        normalized.sort(key=lambda proposal: (
-            proposal.bbox.y1 if proposal.bbox else math.inf,
-            proposal.bbox.x1 if proposal.bbox else math.inf,
-            tuple(sorted(proposal.text_region_ids)),
-        ))
-        claimants: dict[str, list[int]] = defaultdict(list)
-        for proposal_index, proposal in enumerate(normalized):
-            for region_id in proposal.text_region_ids:
-                claimants[region_id].append(proposal_index)
-        conflicted = {region_id for region_id, owners in claimants.items() if len(owners) > 1}
-        groups: list[_BalloonGroup] = []
-        ambiguous: set[str] = set(conflicted)
+        normalized.sort(
+            key=lambda proposal: (
+                proposal.bbox.y1,
+                proposal.bbox.x1,
+                proposal.bbox.y2,
+                proposal.bbox.x2,
+                -(proposal.confidence or 0.0),
+            )
+        )
+        deduplicated: list[BalloonProposal] = []
+        for proposal in normalized:
+            duplicate = next(
+                (
+                    previous
+                    for previous in deduplicated
+                    if _iou(proposal.bbox, previous.bbox) >= self.duplicate_iou_threshold
+                ),
+                None,
+            )
+            if duplicate is None:
+                deduplicated.append(proposal)
+
+        proposal_ids = [
+            _deterministic_id("balloon-layout", sequence_id, page_index, index)
+            for index in range(1, len(deduplicated) + 1)
+        ]
+        assigned_by_proposal: dict[int, list[str]] = defaultdict(list)
+        ambiguous: dict[str, tuple[list[str], dict[str, Any]]] = {}
         claimed: set[str] = set()
-        for proposal_index, proposal in enumerate(normalized):
-            members = [
-                region_id for region_id in proposal.text_region_ids
-                if region_id not in conflicted
-            ]
-            if not members:
+        for region in regions:
+            if not _valid_bbox(region.bbox):
                 continue
+            region_area = _area(region.bbox)
+            overlaps = [
+                (
+                    _intersection_area(region.bbox, proposal.bbox) / region_area,
+                    index,
+                )
+                for index, proposal in enumerate(deduplicated)
+                if region_area > 0
+                and _intersection_area(region.bbox, proposal.bbox) > 0
+            ]
+            overlaps.sort(key=lambda item: (-item[0], item[1]))
+            compatible = [(score, index) for score, index in overlaps if score >= 0.25]
+            if not compatible:
+                continue
+            best_score, best_index = compatible[0]
+            next_score = compatible[1][0] if len(compatible) > 1 else 0.0
+            if best_score >= 0.5 and best_score - next_score >= 0.15:
+                assigned_by_proposal[best_index].append(region.id)
+                claimed.add(region.id)
+            else:
+                ambiguous[region.id] = (
+                    [proposal_ids[index] for _, index in compatible],
+                    {
+                        "reason": "competing_or_partial_balloon_overlap",
+                        "overlap_by_candidate_balloon": {
+                            proposal_ids[index]: score for score, index in compatible
+                        },
+                    },
+                )
+
+        groups: list[_BalloonGroup] = []
+        for proposal_index, proposal in enumerate(deduplicated):
+            members = list(assigned_by_proposal.get(proposal_index, []))
             panel_ids = {
                 memberships[region_id].panel_id for region_id in members
                 if memberships[region_id].panel_id is not None
             }
-            requested_panel = proposal.panel_id
-            if requested_panel not in {panel.id for panel in panels}:
-                requested_panel = None
-            panel_id = requested_panel or (next(iter(panel_ids)) if len(panel_ids) == 1 else None)
             if len(panel_ids) > 1:
-                ambiguous.update(members)
-                continue
+                for region_id in members:
+                    ambiguous[region_id] = (
+                        [proposal_ids[proposal_index]],
+                        {"reason": "ctd_fragments_cross_panel_ownership"},
+                    )
+                    claimed.discard(region_id)
+                members = []
             groups.append(
                 _BalloonGroup(
                     region_ids=members,
-                    bbox=proposal.bbox or _union_bbox([region_by_id[item].bbox for item in members]),
-                    panel_id=panel_id,
+                    bbox=proposal.bbox,
+                    panel_id=next(iter(panel_ids)) if len(panel_ids) == 1 else None,
                     confidence=proposal.confidence,
                     method="layout_model",
+                    balloon_id=proposal_ids[proposal_index],
+                    mask_polygon=proposal.mask_polygon,
                     kind=proposal.kind,
-                    evidence={**proposal.evidence, "layout_proposal_index": proposal_index},
+                    evidence={**proposal.evidence, "proposal_index": proposal_index},
                 )
             )
-            claimed.update(members)
-        for region_id in conflicted:
-            diagnostics.append(
-                LayoutDiagnostic(
-                    component="balloon_layout_provider",
-                    error_type="ConflictingRegionOwnership",
-                    message=f"CTD region {region_id!r} was claimed by overlapping proposals.",
-                )
-            )
-        return groups, claimed, ambiguous
+        return groups, claimed, ambiguous, True, len(deduplicated)
 
     def _geometry_groups(
         self,
@@ -788,10 +847,12 @@ class PageLayoutGrouper:
         panels: Sequence[Panel],
         memberships: Mapping[str, _RegionMembership],
         ambiguous_ids: Sequence[str],
+        layout_ambiguity: Mapping[str, tuple[list[str], dict[str, Any]]],
+        existing_groups: list[_BalloonGroup],
         sequence_id: str,
         page_index: int,
         diagnostics: list[LayoutDiagnostic],
-    ) -> list[_BalloonGroup]:
+    ) -> tuple[list[_BalloonGroup], set[str]]:
         assert self.visual_grouping_provider is not None
         by_id = {region.id: region for region in regions}
         try:
@@ -799,6 +860,11 @@ class PageLayoutGrouper:
                 image_path,
                 [by_id[region_id] for region_id in ambiguous_ids],
                 ambiguous_ids,
+                {
+                    region_id: layout_ambiguity[region_id][0]
+                    for region_id in ambiguous_ids
+                    if region_id in layout_ambiguity
+                },
                 panels,
             )
         except Exception as exc:  # noqa: BLE001 - visual confirmation is an optional fallback
@@ -809,10 +875,11 @@ class PageLayoutGrouper:
                     message=str(exc),
                 )
             )
-            return []
+            return [], set()
 
         groups: list[_BalloonGroup] = []
         accepted_ids: set[str] = set()
+        resolved_ids: set[str] = set()
         for proposal_index, raw in enumerate(proposals, start=1):
             try:
                 proposal = raw if isinstance(raw, VisualGroupingProposal) else VisualGroupingProposal.model_validate(raw)
@@ -828,10 +895,62 @@ class PageLayoutGrouper:
             members = list(dict.fromkeys(proposal.text_region_ids))
             if (
                 proposal.confidence < self.visual_acceptance_threshold
-                or len(members) < 2
                 or any(member not in ambiguous_ids for member in members)
                 or accepted_ids.intersection(members)
             ):
+                continue
+
+            if proposal.target_balloon_id is not None:
+                allowed_targets = [
+                    set(layout_ambiguity.get(member, ([], {}))[0])
+                    for member in members
+                ]
+                target_group = next(
+                    (
+                        candidate
+                        for candidate in existing_groups
+                        if candidate.balloon_id == proposal.target_balloon_id
+                    ),
+                    None,
+                )
+                if (
+                    target_group is None
+                    or any(proposal.target_balloon_id not in targets for targets in allowed_targets)
+                ):
+                    continue
+                panel_ids = {
+                    memberships[member].panel_id
+                    for member in members
+                    if memberships[member].panel_id is not None
+                }
+                if (
+                    target_group.panel_id is not None
+                    and panel_ids
+                    and panel_ids != {target_group.panel_id}
+                ):
+                    continue
+                target_group_index = existing_groups.index(target_group)
+                existing_groups[target_group_index] = target_group.model_copy(update={
+                    "region_ids": list(dict.fromkeys(target_group.region_ids + members)),
+                    "panel_id": (
+                        next(iter(panel_ids))
+                        if target_group.panel_id is None and len(panel_ids) == 1
+                        else target_group.panel_id
+                    ),
+                    "bbox": _union_bbox(
+                        [target_group.bbox] + [by_id[member].bbox for member in members]
+                    ),
+                    "confidence": proposal.confidence,
+                    "evidence": {
+                        **target_group.evidence,
+                        "visual_membership_confirmation": proposal.evidence,
+                    },
+                })
+                accepted_ids.update(members)
+                resolved_ids.update(members)
+                continue
+
+            if len(members) < 2:
                 continue
             panel_ids = {
                 memberships[member].panel_id for member in members
@@ -850,7 +969,7 @@ class PageLayoutGrouper:
                     evidence=proposal.evidence,
                 )
             )
-        return groups
+        return groups, resolved_ids
 
     @staticmethod
     def _materialize_balloons(
@@ -859,7 +978,7 @@ class PageLayoutGrouper:
         page_index: int,
     ) -> list[tuple[Balloon, list[str]]]:
         ordered = sorted(
-            groups,
+            (group for group in groups if group.region_ids),
             key=lambda group: (
                 group.bbox.y1,
                 group.bbox.x1,
@@ -872,12 +991,14 @@ class PageLayoutGrouper:
         for index, group in enumerate(ordered, start=1):
             records.append((
                 Balloon(
-                    id=_deterministic_id("balloon", sequence_id, page_index, index),
+                    id=group.balloon_id
+                    or _deterministic_id("balloon-geometry", sequence_id, page_index, index),
                     bbox=group.bbox,
                     panel_id=group.panel_id,
                     confidence=group.confidence,
                     grouping_method=group.method,
                     grouping_evidence=group.evidence,
+                    mask_polygon=group.mask_polygon,
                     kind=group.kind,
                     text_region_ids=group.region_ids,
                 ),

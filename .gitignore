@@ -1,13 +1,36 @@
-.venv
-.*cache
-outputs/
+# Python environments and caches
+.venv/
+.venv-nemotron/
+.uv/
 .conda/
 __pycache__/
 *.py[cod]
 *$py.class
-.uv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local model downloads and runtime state
+.*cache/
 .cuda/
-downloads/
-.venv-nemotron/
 .torch/
+downloads/
 nemotron-ocr-v2/
+outputs/
+.smoke/
+
+# Local machine/editor files
+.env
+.env.*
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local logs and reports
+*.log
+*.out

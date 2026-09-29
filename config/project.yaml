@@ -1,0 +1,174 @@
+# ============================================================
+# STORY-AI — Canonical Project Configuration
+# ============================================================
+#
+# All paths are repository-relative unless noted.
+# Machine-specific paths support environment-variable overrides
+# so that the same config works on any developer machine without
+# modification.  See the override comments on each section.
+#
+# NEVER hard-code absolute Windows paths into production code.
+# Use config_loader.py or pass paths explicitly from here.
+# ============================================================
+
+# ------------------------------------------------------------
+# Repository root
+# (detected at runtime; do not hard-code)
+# ------------------------------------------------------------
+repository:
+  root: "."                  # resolved at runtime relative to this file
+
+# ------------------------------------------------------------
+# Python environment
+# ------------------------------------------------------------
+python:
+  required_version: "3.11"   # matches .python-version
+  venv_dir: ".venv"
+  nemotron_venv_dir: ".venv-nemotron"
+
+# ------------------------------------------------------------
+# Dataset paths
+# All relative to repository root.
+# ------------------------------------------------------------
+dataset:
+  root: "dataset"
+  sequences_file: "dataset/sequences.json"
+  development_dir: "dataset/development"
+  development_images_dir: "dataset/development/images"
+  development_labels_file: "dataset/development/labels.jsonl"
+  test_dir: "dataset/test"
+  test_images_dir: "dataset/test/images"
+  sample_submission_file: "dataset/sample_submission.jsonl"
+  score_file: "dataset/score.py"
+
+# ------------------------------------------------------------
+# Vendor / bundled code
+# ------------------------------------------------------------
+vendor:
+  ctd_dir: "vendor/comic-text-detector"
+  ctd_model: "vendor/comic-text-detector/data/comictextdetector.pt.onnx"
+
+# ------------------------------------------------------------
+# Model paths
+#
+# These are local-model-cache locations; paths may vary per machine.
+# Override with environment variables listed below each entry.
+#
+#   CTD:      no env-var needed (bundled in vendor/)
+#   PaddleOCR: STORYAI_PADDLE_MODEL_DIR
+#   Qwen:      STORYAI_QWEN_CACHE_DIR  (HuggingFace cache root)
+#   Layout:    STORYAI_LAYOUT_WEIGHTS
+#   RT-DETR:   STORYAI_RTDETR_MODEL
+#   Nemotron:  STORYAI_NEMOTRON_DIR
+# ------------------------------------------------------------
+models:
+
+  # CTD — bundled in vendor/
+  ctd:
+    model_file: "vendor/comic-text-detector/data/comictextdetector.pt.onnx"
+    device: "cpu"
+
+  # PaddleOCR — locally cached ONNX model
+  paddleocr:
+    # Override: STORYAI_PADDLE_MODEL_DIR
+    # Default: ~/.paddlex/official_models/en_PP-OCRv5_mobile_rec_onnx
+    model_name: "en_PP-OCRv5_mobile_rec"
+    model_dir_default: "~/.paddlex/official_models/en_PP-OCRv5_mobile_rec_onnx"
+    engine: "onnxruntime"
+    device: "cpu"
+
+  # Qwen3-VL — loaded via HuggingFace transformers
+  qwen:
+    # Override: STORYAI_QWEN_CACHE_DIR (sets HF_HOME / TRANSFORMERS_CACHE)
+    # Default: ~/.cache/huggingface/hub
+    model_id: "Qwen/Qwen3-VL-4B-Instruct"
+    load_in_4bit: true
+    device_map: "auto"
+    max_new_tokens: 256
+    cache_dir_default: "~/.cache/huggingface/hub"
+
+  # Manga balloon layout (YOLO)
+  manga_layout:
+    # Override: STORYAI_LAYOUT_WEIGHTS
+    # Default: ~/.cache/huggingface/hub/models--huyvux3005--manga109-segmentation-bubble/...
+    model_id: "huyvux3005/manga109-segmentation-bubble"
+    snapshot: "f9a4108c4955136a810e5e92207972f3fb3a65fd"
+    weight_filename: "best.pt"
+    cache_dir_default: "~/.cache/huggingface/hub"
+
+  # RT-DETRv4 character detection
+  rtdetr:
+    # Override: STORYAI_RTDETR_MODEL
+    # Default: ~/.cache/huggingface/hub/models--tori29umai--rtdetrv4-x-manga109s_v2/...
+    model_id: "tori29umai/rtdetrv4-x-manga109s_v2"
+    snapshot: "864c3bfb837a03ecc62557d5152a5ade5566489b"
+    onnx_filename: "model.onnx"
+    cache_dir_default: "~/.cache/huggingface/hub"
+
+  # Nemotron OCR v2 — WSL-side model
+  nemotron:
+    # Override: STORYAI_NEMOTRON_DIR
+    # The worker runs inside WSL; the Windows bridge communicates via stdin/stdout.
+    wsl_worker_script: "tools/nemotron_worker.py"
+    wsl_venv: ".venv-nemotron"
+    # nemotron-ocr-v2/ is gitignored (large model files, WSL-side)
+    model_dir_default: "nemotron-ocr-v2"
+
+  # MobileNetV3 character embeddings (loaded from torchvision pretrained)
+  mobilenetv3:
+    pretrained: true
+    device: "cpu"
+
+# ------------------------------------------------------------
+# Smoke / output directories
+# Generated at runtime; gitignored.
+# ------------------------------------------------------------
+smoke:
+  pipeline_integration_dir: ".smoke/pipeline-integration"
+  log_file: ".smoke/pipeline_integration_run.log"
+
+outputs:
+  dir: "outputs"
+
+# ------------------------------------------------------------
+# Device / inference defaults
+# ------------------------------------------------------------
+device:
+  qwen_device: "cuda"          # Qwen requires CUDA (falls back gracefully)
+  ctd_device: "cpu"
+  paddle_device: "cpu"
+  rtdetr_device: "cpu"
+  embeddings_device: "cpu"
+
+# ------------------------------------------------------------
+# Inference parameters
+# ------------------------------------------------------------
+inference:
+  # Adjudication
+  adjudication_max_new_tokens: 512
+  adjudication_temperature: 0.0
+
+  # Candidate Bank
+  candidate_sources:
+    - "ocr_base"
+    - "ocr_upscale"
+    - "ocr_contrast"
+    - "ocr_threshold"
+    - "ocr_rotate_cw"
+    - "ocr_rotate_ccw"
+    - "nemotron"
+    - "qwen3_vl"
+    - "fused"
+
+  # Layout
+  balloon_iou_threshold: 0.5
+  ctd_iou_suppression_threshold: 0.85
+
+# ------------------------------------------------------------
+# Runtime flags
+# ------------------------------------------------------------
+runtime:
+  # Set true to skip Nemotron when WSL bridge is unavailable
+  nemotron_optional: true
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  log_level: "INFO"

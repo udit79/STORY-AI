@@ -29,6 +29,11 @@ dependencies = [
     "wandb>=0.30.0",
 ]
 
+[project.optional-dependencies]
+manga-layout = [
+    "ultralytics>=8.3.0,<9.0.0",
+]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu121" }
 torchvision = { index = "pytorch-cu121" }
@@ -36,3 +41,7 @@ torchvision = { index = "pytorch-cu121" }
 [[tool.uv.index]]
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
+
+[tool.ruff.lint]
+# tools/ scripts manipulate sys.path before app imports — E402 is expected there.
+per-file-ignores = { "tools/*.py" = ["E402"] }
