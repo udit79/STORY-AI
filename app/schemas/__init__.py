@@ -10,6 +10,7 @@ from .page import (
 	BoundingBox,
 	CharacterInstance,
 	PageRepresentation,
+	Panel,
 	TextRegion,
 )
 from .sequence import (
@@ -28,6 +29,7 @@ __all__ = [
 	"CharacterInstance",
 	"DatasetSplit",
 	"PageRepresentation",
+	"Panel",
 	"SequenceRecord",
 	"SequenceRepresentation",
 	"TextRegion",

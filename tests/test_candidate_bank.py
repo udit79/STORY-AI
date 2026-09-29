@@ -136,6 +136,25 @@ def test_normalization_preserves_source_and_raw_supporting_metadata():
     assert candidate.evidence.semantic_type == "thought"
 
 
+def test_normalization_drops_non_serializable_backend_metadata():
+    import numpy as np
+
+    candidate = normalize_candidate(
+        make_region(),
+        "ocr_base",
+        {
+            "rec_text": "Visible text",
+            "rec_score": 0.8,
+            "input_image": np.zeros((2, 2, 3), dtype=np.uint8),
+        },
+    )
+
+    assert candidate is not None
+    assert candidate.evidence.source_metadata["rec_text"] == "Visible text"
+    assert "input_image" not in candidate.evidence.source_metadata
+    candidate.model_dump_json()
+
+
 def test_empty_candidate_text_is_skipped_and_schema_rejects_blank_text():
     assert normalize_candidate(make_region(), "nemotron", {"text": "  "}) is None
     with pytest.raises(ValidationError):

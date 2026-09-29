@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -14,7 +14,7 @@ class TextRegion(BaseModel):
     id: str
     bbox: BoundingBox
     raw_text: str
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
     category: Literal[
         "unknown",
@@ -36,9 +36,26 @@ class CharacterInstance(BaseModel):
     description: str | None = None
 
 
+class Panel(BaseModel):
+    id: str
+    bbox: BoundingBox
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    source: Literal["layout_model", "page_fallback"] = "layout_model"
+
+
 class Balloon(BaseModel):
     id: str
     bbox: BoundingBox
+    panel_id: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    grouping_method: Literal[
+        "layout_model",
+        "geometry",
+        "containment",
+        "hybrid",
+        "visual_fallback",
+    ] = "geometry"
+    grouping_evidence: dict[str, Any] = Field(default_factory=dict)
 
     kind: Literal[
         "speech",
@@ -56,6 +73,7 @@ class PageRepresentation(BaseModel):
     image_path: str
 
     text_regions: list[TextRegion] = Field(default_factory=list)
+    panels: list[Panel] = Field(default_factory=list)
     balloons: list[Balloon] = Field(default_factory=list)
     characters: list[CharacterInstance] = Field(default_factory=list)
 

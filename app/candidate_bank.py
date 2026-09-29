@@ -60,6 +60,46 @@ SEMANTIC_TYPES = {
     "document_text",
 }
 
+_SKIP_METADATA = object()
+
+
+def _metadata_value(value: Any) -> Any:
+    """Keep useful scalar metadata without retaining images or opaque objects."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {
+            str(key): safe_value
+            for key, item in value.items()
+            if (safe_value := _metadata_value(item)) is not _SKIP_METADATA
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            safe_value
+            for item in value
+            if (safe_value := _metadata_value(item)) is not _SKIP_METADATA
+        ]
+
+    scalar_item = getattr(value, "item", None)
+    if callable(scalar_item):
+        try:
+            scalar = scalar_item()
+        except (TypeError, ValueError):
+            return _SKIP_METADATA
+        if scalar is not value:
+            return _metadata_value(scalar)
+    return _SKIP_METADATA
+
+
+def _safe_source_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): safe_value
+        for key, value in payload.items()
+        if (safe_value := _metadata_value(value)) is not _SKIP_METADATA
+    }
+
 
 def _as_mapping(raw: Any) -> dict[str, Any]:
     if isinstance(raw, Mapping):
@@ -203,7 +243,7 @@ def normalize_candidate(
         semantic_type=semantic,
         preprocessing=preprocessing,
         notes=notes,
-        source_metadata=dict(payload),
+        source_metadata=_safe_source_metadata(payload),
     )
     return TranscriptionCandidate(
         candidate_id=candidate_id or f"{region.id}:{source}",
