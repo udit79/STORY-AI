@@ -10,6 +10,13 @@ TestClient = importlib.import_module("fastapi.testclient").TestClient
 api = importlib.import_module("app.api")
 
 
+def test_root_redirects_to_swagger_docs():
+    response = TestClient(api.app).get("/", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/docs"
+
+
 def test_character_graph_keeps_identity_edges_and_speaker_links():
     graph = api.build_character_graph(
         {

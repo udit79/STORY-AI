@@ -15,7 +15,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +32,12 @@ app = FastAPI(
     ),
     version="0.1.0",
 )
+
+
+@app.get("/", include_in_schema=False)
+def api_root() -> RedirectResponse:
+    """Send visitors who open the bare API address to interactive docs."""
+    return RedirectResponse(url="/docs", status_code=307)
 
 
 class RunOptions(BaseModel):

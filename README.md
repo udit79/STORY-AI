@@ -1,17 +1,26 @@
-# STORY-AI
+<p align="center">
+  <img src="assets/story_ai_logo.png" alt="STORY-AI logo" width="300">
+</p>
 
-STORY-AI turns three consecutive English manga pages into an ordered JSONL transcript with text and sequence-local speaker labels, using local vision and OCR models.
+<h1 align="center">STORY-AI</h1>
+
+<p align="center">Turns three consecutive English manga pages into an ordered JSONL transcript with text and sequence-local speaker labels, using local vision and OCR models.</p>
 
 ## Demo
 
+Start the local API, open its interactive documentation, and try a dataset sequence or upload three page images:
 
-![STORY-AI pipeline illustration](assets/story_ai_pipeline.png)
+[Open FastAPI docs](http://127.0.0.1:8000/docs)
 
-<!-- ADD: screenshot or short GIF of a real run and its validated JSONL output -->
+This is a local demo URL; the API must be started using the instructions below. It is not a hosted service.
 
 ## Problem and solution
 
 The repository addresses the task of extracting story text from three-page manga sequences while preserving page order and assigning speakers consistently within a sequence. STORY-AI combines text localization, balloon grouping, OCR evidence, image-based adjudication, character detections, and sequence-level reconciliation. It writes the contest-style JSONL structure consumed by `dataset/score.py`.
+
+## Dataset
+
+`dataset/sequences.json` contains **95 sequences**: 80 development sequences with references in `dataset/development/labels.jsonl`, and 15 test sequences without references in this repository. Each sequence has three consecutive page images. `dataset/sample_submission.jsonl` defines the test IDs and output template; `dataset/score.py` scores predictions when matching references are available.
 
 ## Key features
 
@@ -50,6 +59,8 @@ flowchart TD
 ```
 
 The test runner reads the 15 sequence IDs from `dataset/sample_submission.jsonl` and their three image paths from `dataset/sequences.json`. CTD finds text-like regions; the YOLO checkpoint proposes balloon shapes, and the grouping code associates regions with balloons. PaddleOCR proposes text from CTD line crops, while Nemotron can optionally propose text from balloon crops; Qwen reads the balloon image and adjudicates the final text and inclusion decision. RT-DETRv4 detects character bodies and faces; geometry grounds speakers, MobileNetV3 embeddings support cross-page identity, and deterministic reading-order logic feeds the sequence resolver. The validator checks the final three-page JSONL records before the runner writes `outputs/test_predictions.jsonl`.
+
+![Conceptual pipeline illustration](assets/story_ai_pipeline.png)
 
 Text and speaker attribution are separate. Qwen3-VL produces each balloon's final transcription after reading its image and comparing OCR hypotheses. The speaker grounder selects a likely character from spatial evidence; sequence-level identity resolution keeps anonymous character labels consistent across pages. The resolver reconciles these upstream results and order; it does not independently read the image or prove the transcription is correct. Validation enforces references and output structure, not semantic accuracy. Ambiguous speaker evidence is serialized as `UNKNOWN`.
 
@@ -110,7 +121,7 @@ uv sync --extra manga-layout --extra api
 .venv\Scripts\python.exe -m uvicorn app.api:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000/docs`. Swagger's **Try it out** controls let you inspect request fields, attach page images, and call each route.
+Open `http://127.0.0.1:8000/docs`. Swagger's **Try it out** controls let you inspect request fields, attach page images, and call each route. If you open the base address `http://127.0.0.1:8000/` by mistake, it redirects to `/docs`.
 
 | Method | Path                                  | Purpose                                                                                                                                                        |
 | ------ | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -202,11 +213,17 @@ The official scorer was also run on one held-out development sequence, `seq_952f
 
 The balanced joint F1 differs by 0.0022 in Nemotron's favor, while Paddle leads text order and matched-token coverage. These results do not establish performance across all development sequences or the contest test set. The measured speaker accuracy and the number of `UNKNOWN` outputs indicate that speaker assignment remains a substantial limitation.
 
+## Results
+
+The fresh full test run processed all **15 sequences** and produced **177 story items**. Four page lists were empty; 102 items use `UNKNOWN` for unresolved speakers. All 15 per-sequence runs reported `PASS` with zero pipeline validation errors, and the aggregate JSONL passes `tools/validate_submission.py`. The final file is [outputs/test_predictions.jsonl](outputs/test_predictions.jsonl).
+
+These are structural and completion results, not an accuracy score. The test split has no reference labels in this repository, so official test accuracy cannot be calculated here. The development OCR and end-to-end measurements above are the available scored results.
+
 ## Status and limitations
 
 - The repository has unit and integration tests; the latest run passed 225 tests. Pytest is in the optional `dev` extra. A Windows cache-permission warning may appear if pytest cannot write `.pytest_cache`.
 - Evaluation evidence is limited: the paired OCR comparison has 86 matched development crops, and the end-to-end comparison covers one held-out sequence.
-- The local full-test run generated 15 sequences and 177 items; the validator found four empty page lists and zero structural errors. Test references are not present in this repository, so test-set accuracy cannot be scored from this checkout alone. Only `outputs/test_predictions.jsonl` is Git-eligible; other output artifacts are ignored.
+- Test references are not present in this repository, so test-set accuracy cannot be scored from this checkout alone. Only `outputs/test_predictions.jsonl` is Git-eligible; other output artifacts are ignored.
 - Speaker grounding and cross-page identity remain weak. Qwen visual speaker grounding is optional and disabled by default.
 - Inference is a local command-line workflow. No web interface, hosted deployment, or live demo is present in the repository.
 - The prediction runner expects local files for PaddleOCR, Qwen3-VL, YOLO, and RT-DETRv4. Missing files prevent those backends from loading; the torchvision MobileNetV3 weights may be fetched if uncached, and setup checks do not fetch model weights.
