@@ -4,7 +4,6 @@ STORY-AI turns three consecutive English manga pages into an ordered JSONL trans
 
 ## Demo
 
-No hosted demo, video, or slides link was supplied. The image below is a project illustration, not a screenshot of a running interface.
 
 ![STORY-AI pipeline illustration](assets/story_ai_pipeline.png)
 
