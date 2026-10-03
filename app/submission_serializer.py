@@ -39,6 +39,7 @@ Architecture:
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from typing import Any
 
@@ -87,7 +88,7 @@ def _submission_speaker(label: str | None, *, identity_state: str = "null") -> s
 
     Rules:
         - NARRATION: kept as "NARRATION".
-        - A valid anonymous label (A, B, C, …) from a *matched* or *unmatched*
+        - A valid anonymous label (Character A, Character B, …) from a *matched* or *unmatched*
           cluster: kept as-is.
         - Ambiguous identity state: the internal label is kept for traceability
           in SequenceResolution, but the competition output must be "UNKNOWN"
@@ -103,6 +104,8 @@ def _submission_speaker(label: str | None, *, identity_state: str = "null") -> s
         return "UNKNOWN"
     if label == "NARRATION":
         return "NARRATION"
+    if re.fullmatch(r"[A-Z]+", label):
+        label = f"Character {label}"
     # Ambiguous identity evidence must not become a falsely confident label.
     if identity_state == "ambiguous":
         return "UNKNOWN"

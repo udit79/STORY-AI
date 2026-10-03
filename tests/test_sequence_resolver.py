@@ -207,7 +207,7 @@ def test_normal_fully_resolved_sequence():
     assert len(resolution.ordered_balloons) == 3
     assert [b.balloon_id for b in resolution.ordered_balloons] == ["b0", "b1", "b2"]
     assert [b.sequence_position for b in resolution.ordered_balloons] == [0, 1, 2]
-    assert [b.speaker_label for b in resolution.ordered_balloons] == ["A", "B", "C"]
+    assert [b.speaker_label for b in resolution.ordered_balloons] == ["Character A", "Character B", "Character C"]
     assert resolution.ordered_balloons[0].text == "Page 0 line."
 
     errors = validate_sequence_resolution(
@@ -258,7 +258,7 @@ def test_repeated_speaker_across_pages():
     )
 
     labels = [b.speaker_label for b in resolution.ordered_balloons]
-    assert labels == ["A", "A", "A"], f"Expected all A, got {labels}"
+    assert labels == ["Character A", "Character A", "Character A"], f"Expected all Character A, got {labels}"
     identity_ids = [b.speaker_identity_id for b in resolution.ordered_balloons]
     assert all(iid == "identity-001" for iid in identity_ids)
 
@@ -285,7 +285,7 @@ def test_speaker_instance_to_label_mapping():
     balloon = resolution.ordered_balloons[0]
     assert balloon.speaker_character_instance_id == "char-p0-X"
     assert balloon.speaker_identity_id == "identity-001"
-    assert balloon.speaker_label == "B"
+    assert balloon.speaker_label == "Character B"
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +337,7 @@ def test_ambiguous_identity_cluster():
 
     balloon = resolution.ordered_balloons[0]
     # Label is preserved for traceability even when ambiguous
-    assert balloon.speaker_label == "A"
+    assert balloon.speaker_label == "Character A"
     assert balloon.identity_state == "ambiguous"
     # A diagnostic warning must be emitted
     diag_codes = [d.code for d in balloon.diagnostics]
@@ -370,10 +370,10 @@ def test_unmatched_character_no_cluster():
     )
 
     balloon = resolution.ordered_balloons[0]
-    assert balloon.speaker_label is None
-    assert balloon.speaker_identity_id is None
-    diag_codes = [d.code for d in balloon.diagnostics]
-    assert "speaker_identity_unresolved" in diag_codes
+    assert balloon.speaker_label == "Character A"
+    assert balloon.speaker_identity_id == "identity-001"
+    assert resolution.identities[0].member_character_ids == ["char-p0-solo"]
+    assert resolution.identities[0].state == "unmatched"
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +577,7 @@ def test_identity_label_conflict_detected():
     # All balloons should get label A (from identity), no conflict here since
     # we can't truly corrupt via this path — both balloons share the same char.
     labels = {b.speaker_label for b in resolution.ordered_balloons}
-    assert labels == {"A"}
+    assert labels == {"Character A"}
     # No label conflict diagnostic since both correctly receive "A"
     diag_codes = [d.code for d in resolution.diagnostics]
     assert "identity_label_conflict" not in diag_codes
@@ -609,7 +609,7 @@ def test_deterministic_anonymous_labels():
     labels1 = [b.speaker_label for b in res1.ordered_balloons]
     labels2 = [b.speaker_label for b in res2.ordered_balloons]
     assert labels1 == labels2
-    assert labels1 == ["A", "B", "C"]
+    assert labels1 == ["Character A", "Character B", "Character C"]
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +739,7 @@ def test_serializer_exact_competition_schema():
     assert len(parsed["pages"][0]) == 1
     item = parsed["pages"][0][0]
     assert set(item.keys()) == {"speaker", "text"}
-    assert item["speaker"] == "A"
+    assert item["speaker"] == "Character A"
     assert item["text"] == "Hello there."
 
     # Pages 1 and 2 are empty
@@ -883,7 +883,7 @@ def test_serializer_unresolved_speaker_uses_unknown():
     """Unresolved speaker → 'UNKNOWN' in submission."""
     assert _submission_speaker(None) == "UNKNOWN"
     assert _submission_speaker("") == "UNKNOWN"
-    assert _submission_speaker("A") == "A"
+    assert _submission_speaker("Character A") == "Character A"
     assert _submission_speaker("NARRATION") == "NARRATION"
 
 
@@ -895,12 +895,12 @@ def test_serializer_ambiguous_identity_emits_unknown():
     cluster is ambiguous and the label cannot be treated as confident.
     """
     # Verify _submission_speaker directly
-    assert _submission_speaker("A", identity_state="ambiguous") == "UNKNOWN"
-    assert _submission_speaker("B", identity_state="ambiguous") == "UNKNOWN"
+    assert _submission_speaker("Character A", identity_state="ambiguous") == "UNKNOWN"
+    assert _submission_speaker("Character B", identity_state="ambiguous") == "UNKNOWN"
     assert _submission_speaker("NARRATION", identity_state="ambiguous") == "NARRATION"  # narration is always NARRATION
-    assert _submission_speaker("A", identity_state="matched") == "A"
-    assert _submission_speaker("A", identity_state="unmatched") == "A"
-    assert _submission_speaker("A", identity_state="null") == "A"
+    assert _submission_speaker("Character A", identity_state="matched") == "Character A"
+    assert _submission_speaker("Character A", identity_state="unmatched") == "Character A"
+    assert _submission_speaker("Character A", identity_state="null") == "Character A"
 
     # End-to-end: ambiguous identity cluster → UNKNOWN in the submission record
     char = make_char("char-p0-amb")
@@ -919,7 +919,7 @@ def test_serializer_ambiguous_identity_emits_unknown():
 
     # Internal resolution retains 'A' for traceability
     balloon = resolution.ordered_balloons[0]
-    assert balloon.speaker_label == "A"
+    assert balloon.speaker_label == "Character A"
     assert balloon.identity_state == "ambiguous"
 
     # But the competition submission must use 'UNKNOWN', not 'A'

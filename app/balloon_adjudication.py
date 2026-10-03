@@ -384,7 +384,6 @@ class Qwen3VLBalloonAdjudicator:
                 f"Qwen result failed validation: {type(exc).__name__}: {exc}",
             )
 
-
 def adjudicate_balloon(
     adjudicator: BalloonAdjudicator,
     balloon: Balloon,

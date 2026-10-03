@@ -18,8 +18,10 @@ htmlcov/
 .torch/
 downloads/
 nemotron-ocr-v2/
-outputs/
+outputs/*
+!outputs/test_predictions.jsonl
 .smoke/
+experiments/laya/data/*.png
 
 # Local machine/editor files
 .env

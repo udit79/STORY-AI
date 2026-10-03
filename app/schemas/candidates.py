@@ -21,8 +21,8 @@ class CandidateEvidence(BaseModel):
     """
     Structured evidence attached to one transcription candidate.
 
-    These values are evidence for Laya; they are not assumed to be
-    calibrated probabilities.
+    These values are evidence for downstream adjudication; they are not
+    assumed to be calibrated probabilities.
     """
 
     ocr_confidence: float | None = Field(

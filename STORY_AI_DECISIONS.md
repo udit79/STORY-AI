@@ -38,9 +38,9 @@ This is the canonical stable decision register. Historical decisions and superse
 
 **Status: LOCKED.** Final output must have valid source references, acyclic order, valid speaker references, consistent identities, no excluded text, and no invented source regions. JSONL serialization is validated separately from model quality.
 
-## D010 — LangGraph is the control plane
+## D010 — Runtime orchestration is procedural
 
-**Status: LOCKED.** LangGraph manages sequence state, parallelism, routing, retries, dependencies, and diagnostics. It is not a substitute for component-level perception or resolution logic.
+**Status: LOCKED.** The supported runner calls the Python pipeline for each three-page sequence. The current runtime does not use LangGraph; component boundaries remain in `app/`, while `tools/pipeline_integration_smoke.py` owns execution order and diagnostics.
 
 ## D011 — Laya is historical, not production architecture
 

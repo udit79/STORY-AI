@@ -6,9 +6,9 @@ Architecture exercised (LOCKED):
         ↓ Manga balloon layout/grouping (real local YOLO weights)
         ↓ CTD → balloon grouping
         ↓ Balloon crops
-        ↓ PaddleOCR proposals  (real local cached model)
+        ↓ selected OCR proposals (Paddle line crops or Nemotron balloon paragraphs)
         ↓ Qwen3-VL proposals   (real local cached model, CUDA)
-        ↓ Nemotron             (WSL bridge -- reported unavailable if absent)
+        ↓ Nemotron             (WSL bridge -- one call per balloon)
         ↓ Candidate Bank
         ↓ Qwen multimodal adjudication (real local)
         ↓ Character perception (real RT-DETRv4 ONNX)
@@ -80,48 +80,93 @@ from app.submission_serializer import serialize_resolution_to_jsonl
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_SEQUENCE    = "seq_952f154fb1505883"
-DEFAULT_IMAGE_DIR   = ROOT / "dataset" / "development" / "images" / DEFAULT_SEQUENCE
-DEFAULT_CTD_MODEL   = ROOT / "vendor" / "comic-text-detector" / "data" / "comictextdetector.pt.onnx"
+DEFAULT_SEQUENCE = "seq_952f154fb1505883"
+DEFAULT_IMAGE_DIR = ROOT / "dataset" / "development" / "images" / DEFAULT_SEQUENCE
+DEFAULT_CTD_MODEL = (
+    ROOT / "vendor" / "comic-text-detector" / "data" / "comictextdetector.pt.onnx"
+)
 DEFAULT_LAYOUT_WEIGHTS = (
-    Path.home() / ".cache" / "huggingface" / "hub"
+    Path.home()
+    / ".cache"
+    / "huggingface"
+    / "hub"
     / "models--huyvux3005--manga109-segmentation-bubble"
-    / "snapshots" / "f9a4108c4955136a810e5e92207972f3fb3a65fd" / "best.pt"
+    / "snapshots"
+    / "f9a4108c4955136a810e5e92207972f3fb3a65fd"
+    / "best.pt"
 )
 DEFAULT_PADDLE_MODEL_DIR = (
     Path.home() / ".paddlex" / "official_models" / "en_PP-OCRv5_mobile_rec_onnx"
 )
 DEFAULT_RTDETR_MODEL = (
-    Path.home() / ".cache" / "huggingface" / "hub"
+    Path.home()
+    / ".cache"
+    / "huggingface"
+    / "hub"
     / "models--tori29umai--rtdetrv4-x-manga109s_v2"
-    / "snapshots" / "864c3bfb837a03ecc62557d5152a5ade5566489b" / "model.onnx"
+    / "snapshots"
+    / "864c3bfb837a03ecc62557d5152a5ade5566489b"
+    / "model.onnx"
 )
 DEFAULT_SMOKE_DIR = ROOT / ".smoke" / "pipeline-integration"
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--sequence-id",       default=DEFAULT_SEQUENCE)
-    p.add_argument("--image-dir",         type=Path, default=DEFAULT_IMAGE_DIR)
-    p.add_argument("--ctd-model",         type=Path, default=DEFAULT_CTD_MODEL)
-    p.add_argument("--layout-weights",    type=Path, default=DEFAULT_LAYOUT_WEIGHTS)
-    p.add_argument("--paddle-model-dir",  type=Path, default=DEFAULT_PADDLE_MODEL_DIR)
-    p.add_argument("--rtdetr-model",      type=Path, default=DEFAULT_RTDETR_MODEL)
-    p.add_argument("--smoke-dir",         type=Path, default=DEFAULT_SMOKE_DIR)
-    p.add_argument("--skip-qwen",         action="store_true",
-                   help="Skip Qwen proposals and adjudication (use structural placeholder)")
-    p.add_argument("--skip-paddle",       action="store_true",
-                   help="Skip PaddleOCR proposals")
-    p.add_argument("--skip-nemotron",     action="store_true",
-                   help="Skip Nemotron WSL bridge (report unavailable)")
-    p.add_argument("--skip-visual-speaker", action="store_true",
-                   help="Skip Qwen visual speaker grounding (geometry only)")
+    p.add_argument("--sequence-id", default=DEFAULT_SEQUENCE)
+    p.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR)
+    p.add_argument("--ctd-model", type=Path, default=DEFAULT_CTD_MODEL)
+    p.add_argument("--layout-weights", type=Path, default=DEFAULT_LAYOUT_WEIGHTS)
+    p.add_argument("--paddle-model-dir", type=Path, default=DEFAULT_PADDLE_MODEL_DIR)
+    p.add_argument("--rtdetr-model", type=Path, default=DEFAULT_RTDETR_MODEL)
+    p.add_argument("--smoke-dir", type=Path, default=DEFAULT_SMOKE_DIR)
+    p.add_argument(
+        "--submission-path",
+        type=Path,
+        default=None,
+        help="Write the validated submission JSONL here (default: smoke-dir/sequence/submission.jsonl)",
+    )
+    p.add_argument(
+        "--max-pages",
+        type=int,
+        default=3,
+        help="Process at most this many sorted PNG pages (default: 3)",
+    )
+    p.add_argument(
+        "--keep-backends",
+        action="store_true",
+        help="Keep local models and WSL OCR worker alive for the next in-process sequence",
+    )
+    p.add_argument(
+        "--skip-qwen",
+        action="store_true",
+        help="Skip Qwen proposals and adjudication (use structural placeholder)",
+    )
+    p.add_argument(
+        "--skip-paddle", action="store_true", help="Skip PaddleOCR proposals"
+    )
+    p.add_argument(
+        "--skip-nemotron",
+        action="store_true",
+        help="Skip Nemotron WSL bridge (report unavailable)",
+    )
+    p.add_argument(
+        "--skip-visual-speaker",
+        action="store_true",
+        help="Skip Qwen visual speaker grounding (geometry only)",
+    )
+    p.add_argument(
+        "--enable-qwen-proposals",
+        action="store_true",
+        help="Also run Qwen as an OCR proposal producer; disabled by default when PaddleOCR is available",
+    )
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _hr(char: str = "=", width: int = 72) -> str:
     return char * width
@@ -135,11 +180,23 @@ def _elapsed(start: float) -> str:
     return f"{time.perf_counter() - start:.1f}s"
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    """Return a deterministic linear-interpolated percentile in milliseconds."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return (ordered[lower] * (1.0 - weight) + ordered[upper] * weight) * 1000.0
+
+
 class _ComponentStatus:
     """Track which real backends loaded successfully vs. reported unavailable."""
 
     def __init__(self) -> None:
-        self.available:   list[str] = []
+        self.available: list[str] = []
         self.unavailable: dict[str, str] = {}
 
     def ok(self, name: str) -> None:
@@ -152,6 +209,7 @@ class _ComponentStatus:
 # ---------------------------------------------------------------------------
 # Backend initialization
 # ---------------------------------------------------------------------------
+
 
 def _init_backends(
     args: argparse.Namespace,
@@ -173,7 +231,9 @@ def _init_backends(
     # Manga balloon layout provider
     t = _t()
     try:
-        backends["layout_provider"] = load_manga109_balloon_provider(args.layout_weights)
+        backends["layout_provider"] = load_manga109_balloon_provider(
+            args.layout_weights
+        )
         status.ok(f"MangaLayout YOLO ({_elapsed(t)})")
     except Exception as exc:  # noqa: BLE001
         status.fail("MangaLayout", f"{type(exc).__name__}: {exc}")
@@ -185,6 +245,7 @@ def _init_backends(
         t = _t()
         try:
             from app.models.local_runners import load_paddle_recognizer
+
             paddle = load_paddle_recognizer(
                 args.paddle_model_dir,
                 model_name="en_PP-OCRv5_mobile_rec",
@@ -205,10 +266,11 @@ def _init_backends(
         t = _t()
         try:
             from app.models.local_runners import load_qwen3vl_runner
+
             qwen_runner = load_qwen3vl_runner(
                 local_files_only=True,
                 quantize_4bit=True,
-                max_new_tokens=256,
+                max_new_tokens=128,
             )
             status.ok(f"Qwen3-VL 4B-Instruct ({_elapsed(t)})")
         except Exception as exc:  # noqa: BLE001
@@ -217,10 +279,14 @@ def _init_backends(
         status.fail("Qwen3-VL", "skipped via --skip-qwen")
     backends["qwen_runner"] = qwen_runner
 
-    qwen_candidate_adapter = Qwen3VLCandidateAdapter(qwen_runner) if qwen_runner is not None else None
+    qwen_candidate_adapter = (
+        Qwen3VLCandidateAdapter(qwen_runner) if qwen_runner is not None else None
+    )
     backends["qwen_candidate_adapter"] = qwen_candidate_adapter
 
-    qwen_adjudicator = Qwen3VLBalloonAdjudicator(qwen_runner) if qwen_runner is not None else None
+    qwen_adjudicator = (
+        Qwen3VLBalloonAdjudicator(qwen_runner) if qwen_runner is not None else None
+    )
     backends["qwen_adjudicator"] = qwen_adjudicator
 
     # Nemotron -- WSL persistent bridge
@@ -229,6 +295,7 @@ def _init_backends(
         t = _t()
         try:
             from app.models.nemotron_wsl_bridge import NemotronWSLBridge
+
             bridge = NemotronWSLBridge.start(startup_timeout=180.0)
             # Wrap in NemotronCandidateAdapter (bridge is callable like NemotronOCRV2)
             nemotron_adapter = NemotronCandidateAdapter(bridge, merge_level="paragraph")
@@ -244,7 +311,9 @@ def _init_backends(
     # RT-DETRv4 character provider
     t = _t()
     try:
-        backends["character_provider"] = load_rtdetrv4_character_provider(args.rtdetr_model)
+        backends["character_provider"] = load_rtdetrv4_character_provider(
+            args.rtdetr_model
+        )
         status.ok(f"RT-DETRv4 character provider ({_elapsed(t)})")
     except Exception as exc:  # noqa: BLE001
         status.fail("RTDETRv4", f"{type(exc).__name__}: {exc}")
@@ -267,6 +336,7 @@ def _init_backends(
 # Per-page processing
 # ---------------------------------------------------------------------------
 
+
 def _process_page(
     image_path: Path,
     page_index: int,
@@ -278,15 +348,17 @@ def _process_page(
     speaker_context_store: SpeakerContextImageStore | None,
     timings: dict,
 ) -> tuple[
-    PageRepresentation,             # page with characters + balloons
-    CandidateBank,                  # per-region candidate bank
-    list[BalloonAdjudicationResult], # adjudicated balloons
-    PageSpeakerGroundingResult,     # speaker decisions
-    tuple[int, int],                # (width, height)
-    list[str],                      # per-page warnings
+    PageRepresentation,  # page with characters + balloons
+    CandidateBank,  # per-region candidate bank
+    list[BalloonAdjudicationResult],  # adjudicated balloons
+    PageSpeakerGroundingResult,  # speaker decisions
+    tuple[int, int],  # (width, height)
+    list[str],  # per-page warnings
 ]:
     warnings: list[str] = []
+    t = _t()
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    timings.setdefault("image_loading", []).append(time.perf_counter() - t)
     if image is None:
         raise FileNotFoundError(f"Cannot read page image: {image_path}")
     page_h, page_w = image.shape[:2]
@@ -302,6 +374,9 @@ def _process_page(
     else:
         warnings.append("CTD localizer unavailable; no regions")
         regions = []
+    ctd_timing = getattr(backends["ctd_localizer"], "last_timing", {})
+    for timing_name, elapsed in ctd_timing.items():
+        timings.setdefault(f"ctd_{timing_name}", []).append(float(elapsed))
     timings.setdefault("ctd", []).append(time.perf_counter() - t)
 
     page = PageRepresentation(
@@ -329,14 +404,26 @@ def _process_page(
 
     # ── CTD crops ─────────────────────────────────────────────────────────────
     t = _t()
-    try:
-        ctd_crop_result = ctd_crop_store.generate(
-            image_path, sequence_id, page_index, grouped_page.text_regions
-        )
-    except Exception as exc:  # noqa: BLE001
-        warnings.append(f"CTD crop store failed: {exc}")
-        ctd_crop_result = None
+    ctd_crop_result = None
+    if backends["paddle_adapter"] is not None:
+        try:
+            ctd_crop_result = ctd_crop_store.generate(
+                image_path, sequence_id, page_index, grouped_page.text_regions
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"CTD crop store failed: {exc}")
     timings.setdefault("ctd_crops", []).append(time.perf_counter() - t)
+
+    balloon_crop_paths: dict[str, Path] = {}
+    for balloon in grouped_page.balloons:
+        if not balloon.text_region_ids:
+            continue
+        try:
+            balloon_crop_paths[balloon.id] = balloon_crop_store.create(
+                image_path, sequence_id, page_index, balloon
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Balloon crop failed for {balloon.id}: {exc}")
 
     # ── OCR/VLM candidate production ─────────────────────────────────────────
     t = _t()
@@ -344,9 +431,29 @@ def _process_page(
     producers_to_run = []
     if backends["paddle_adapter"] is not None:
         producers_to_run.append(("paddle", backends["paddle_adapter"]))
+    region_by_id = {region.id: region for region in grouped_page.text_regions}
     if backends.get("nemotron_adapter") is not None:
-        producers_to_run.append(("nemotron", backends["nemotron_adapter"]))
-    if backends["qwen_candidate_adapter"] is not None:
+        for balloon in grouped_page.balloons:
+            crop_path = balloon_crop_paths.get(balloon.id)
+            first_region = next(
+                (
+                    region_by_id[region_id]
+                    for region_id in balloon.text_region_ids
+                    if region_id in region_by_id
+                ),
+                None,
+            )
+            if crop_path is None or first_region is None:
+                continue
+            try:
+                all_candidates.extend(
+                    backends["nemotron_adapter"].candidates(first_region, crop_path)
+                )
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"Nemotron failed on balloon {balloon.id}: {exc}")
+    if backends["qwen_candidate_adapter"] is not None and backends.get(
+        "enable_qwen_proposals", False
+    ):
         producers_to_run.append(("qwen_proposal", backends["qwen_candidate_adapter"]))
 
     if ctd_crop_result is not None:
@@ -365,7 +472,9 @@ def _process_page(
                     produced = producer.candidates(region, crop_path)
                     all_candidates.extend(produced)
                 except Exception as exc:  # noqa: BLE001
-                    warnings.append(f"Producer {producer_name} failed on {region.id}: {exc}")
+                    warnings.append(
+                        f"Producer {producer_name} failed on {region.id}: {exc}"
+                    )
     timings.setdefault("ocr", []).append(time.perf_counter() - t)
 
     candidate_bank = build_candidate_bank(grouped_page.text_regions, all_candidates)
@@ -376,32 +485,34 @@ def _process_page(
 
     for balloon in grouped_page.balloons:
         if not balloon.text_region_ids:
-            adjudication_results.append(BalloonAdjudicationResult(
-                balloon_id=balloon.id,
-                final_text="",
-                text_type="unknown",
-                include_in_story=False,
-            ))
+            adjudication_results.append(
+                BalloonAdjudicationResult(
+                    balloon_id=balloon.id,
+                    final_text="",
+                    text_type="unknown",
+                    include_in_story=False,
+                )
+            )
             continue
 
-        # Create balloon crop
-        balloon_crop_path = None
-        try:
-            balloon_crop_path = balloon_crop_store.create(
-                image_path, sequence_id, page_index, balloon
-            )
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(f"Balloon crop failed for {balloon.id}: {exc}")
+        balloon_crop_path = balloon_crop_paths.get(balloon.id)
 
         if balloon_crop_path is None or backends["qwen_adjudicator"] is None:
             # Fallback: use candidate text if available, else placeholder
             texts = []
             for group in candidate_bank.groups:
                 if group.region_id in balloon.text_region_ids and group.candidates:
-                    best = max(group.candidates, key=lambda c: c.evidence.ocr_confidence or 0.0)
+                    best = max(
+                        group.candidates, key=lambda c: c.evidence.ocr_confidence or 0.0
+                    )
                     if best.text.strip():
                         texts.append(best.text.strip())
-            kind_map = {"speech": "dialogue", "thought": "thought", "narration": "narration", "unknown": "dialogue"}
+            kind_map = {
+                "speech": "dialogue",
+                "thought": "thought",
+                "narration": "narration",
+                "unknown": "dialogue",
+            }
             text_type = kind_map.get(balloon.kind, "dialogue")
             if texts:
                 final_text = " ".join(texts)
@@ -412,12 +523,14 @@ def _process_page(
             else:
                 final_text = ""
                 include_in_story = False
-            adjudication_results.append(BalloonAdjudicationResult(
-                balloon_id=balloon.id,
-                final_text=final_text,
-                text_type=text_type,
-                include_in_story=include_in_story,
-            ))
+            adjudication_results.append(
+                BalloonAdjudicationResult(
+                    balloon_id=balloon.id,
+                    final_text=final_text,
+                    text_type=text_type,
+                    include_in_story=include_in_story,
+                )
+            )
             continue
 
         # Real Qwen adjudication
@@ -432,12 +545,14 @@ def _process_page(
             adjudication_results.append(result)
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"Qwen adjudication failed for {balloon.id}: {exc}")
-            adjudication_results.append(BalloonAdjudicationResult(
-                balloon_id=balloon.id,
-                final_text="",
-                text_type="unknown",
-                include_in_story=False,
-            ))
+            adjudication_results.append(
+                BalloonAdjudicationResult(
+                    balloon_id=balloon.id,
+                    final_text="",
+                    text_type="unknown",
+                    include_in_story=False,
+                )
+            )
 
     timings.setdefault("adjudication", []).append(time.perf_counter() - t)
 
@@ -448,7 +563,9 @@ def _process_page(
         crop_store=char_crop_store,
     )
     try:
-        char_result = char_perception.process_page(grouped_page, sequence_id, image_path)
+        char_result = char_perception.process_page(
+            grouped_page, sequence_id, image_path
+        )
         page_with_chars = char_result.page
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"Character perception failed: {exc}")
@@ -500,12 +617,32 @@ def _process_page(
         )
         final_page = page_with_chars
 
-    return final_page, candidate_bank, adjudication_results, speaker_result, (page_w, page_h), warnings
+    return (
+        final_page,
+        candidate_bank,
+        adjudication_results,
+        speaker_result,
+        (page_w, page_h),
+        warnings,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+_CACHED_BACKENDS = None
+
+
+def shutdown_cached_backends() -> None:
+    """Release the shared model backends used by in-process batch generation."""
+    global _CACHED_BACKENDS
+    if _CACHED_BACKENDS is not None:
+        bridge = _CACHED_BACKENDS.get("_nemotron_bridge")
+        if bridge is not None:
+            bridge.shutdown()
+        _CACHED_BACKENDS = None
+
 
 def main() -> int:
     # Keep help and progress output usable on the default Windows console.
@@ -514,7 +651,9 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args()
 
-    image_files = sorted(args.image_dir.glob("*.png"))[:3]
+    if args.max_pages < 1:
+        raise ValueError("--max-pages must be at least 1")
+    image_files = sorted(args.image_dir.glob("*.png"))[: args.max_pages]
     if not image_files:
         raise FileNotFoundError(f"No PNG pages found in {args.image_dir}")
 
@@ -531,7 +670,15 @@ def main() -> int:
     # ── Backend initialization ────────────────────────────────────────────────
     print("  Initializing real local backends …")
     t_init = _t()
-    backends = _init_backends(args, status)
+    global _CACHED_BACKENDS
+    if _CACHED_BACKENDS is None:
+        backends = _init_backends(args, status)
+        _CACHED_BACKENDS = backends
+    else:
+        backends = _CACHED_BACKENDS
+        status.ok("Reusing local model backends")
+    backends["enable_qwen_proposals"] = args.enable_qwen_proposals
+    timings.setdefault("backend_init", []).append(time.perf_counter() - t_init)
     print(f"  Backend initialization: {_elapsed(t_init)}")
     print()
 
@@ -544,31 +691,37 @@ def main() -> int:
 
     # ── Storage roots ─────────────────────────────────────────────────────────
     smoke_root = args.smoke_dir / args.sequence_id
-    ctd_crop_store      = CTDCropStore(smoke_root / "ctd_crops")
-    balloon_crop_store  = BalloonCropStore(smoke_root / "balloon_crops")
-    char_crop_store     = CharacterCropStore(smoke_root / "char_crops")
+    ctd_crop_store = CTDCropStore(smoke_root / "ctd_crops")
+    balloon_crop_store = BalloonCropStore(smoke_root / "balloon_crops")
+    char_crop_store = CharacterCropStore(smoke_root / "char_crops")
 
     # Speaker context image store (labeled panel crops for Qwen visual grounding)
     use_visual_speaker = not getattr(args, "skip_visual_speaker", False)
     speaker_context_store: SpeakerContextImageStore | None = None
     if use_visual_speaker:
         try:
-            speaker_context_store = SpeakerContextImageStore(smoke_root / "speaker_contexts")
+            speaker_context_store = SpeakerContextImageStore(
+                smoke_root / "speaker_contexts"
+            )
             print(f"  Speaker context store: {smoke_root / 'speaker_contexts'}")
         except Exception as exc:  # noqa: BLE001
             print(f"  ⚠  Speaker context store failed: {exc}")
 
     # ── Per-page processing ───────────────────────────────────────────────────
-    pages:           list[PageRepresentation]         = []
-    candidate_banks: list[CandidateBank]              = []
-    all_adj:         list[BalloonAdjudicationResult]  = []
+    pages: list[PageRepresentation] = []
+    candidate_banks: list[CandidateBank] = []
+    all_adj: list[BalloonAdjudicationResult] = []
     speaker_results: list[PageSpeakerGroundingResult] = []
-    page_sizes:      list[tuple[int, int]]            = []
+    page_sizes: list[tuple[int, int]] = []
     page_stats = []
 
     try:
         for page_index, image_path in enumerate(image_files):
-            print(f"  Processing page {page_index} ({image_path.name}) …", end="", flush=True)
+            print(
+                f"  Processing page {page_index} ({image_path.name}) …",
+                end="",
+                flush=True,
+            )
             t_page = _t()
             try:
                 (
@@ -579,8 +732,13 @@ def main() -> int:
                     size,
                     page_warnings,
                 ) = _process_page(
-                    image_path, page_index, args.sequence_id,
-                    backends, ctd_crop_store, balloon_crop_store, char_crop_store,
+                    image_path,
+                    page_index,
+                    args.sequence_id,
+                    backends,
+                    ctd_crop_store,
+                    balloon_crop_store,
+                    char_crop_store,
                     speaker_context_store,
                     timings,
                 )
@@ -594,15 +752,20 @@ def main() -> int:
             speaker_results.append(speaker_result)
             page_sizes.append(size)
 
-            n_ctd     = len(final_page.text_regions)
+            n_ctd = len(final_page.text_regions)
             n_balloon = len(final_page.balloons)
-            n_story   = sum(1 for r in adj_results if r.include_in_story)
-            n_cands   = sum(len(g.candidates) for g in candidate_bank.groups)
-            n_chars   = len(final_page.characters)
-            page_stats.append({
-                "ctd": n_ctd, "balloons": n_balloon, "story": n_story,
-                "candidates": n_cands, "characters": n_chars,
-            })
+            n_story = sum(1 for r in adj_results if r.include_in_story)
+            n_cands = sum(len(g.candidates) for g in candidate_bank.groups)
+            n_chars = len(final_page.characters)
+            page_stats.append(
+                {
+                    "ctd": n_ctd,
+                    "balloons": n_balloon,
+                    "story": n_story,
+                    "candidates": n_cands,
+                    "characters": n_chars,
+                }
+            )
 
             elapsed_page = _elapsed(t_page)
             print(
@@ -613,13 +776,10 @@ def main() -> int:
                 print(f"    [!]  {w}")
 
     finally:
-        # Shut down Nemotron WSL worker (if it was started) regardless of outcome.
-        bridge = backends.get("_nemotron_bridge")
-        if bridge is not None:
-            try:
-                bridge.shutdown()
-            except Exception:  # noqa: BLE001, S110
-                pass
+        # Keep the heavy local models alive across test sequences when the
+        # generator invokes this main function repeatedly in one process.
+        if not args.keep_backends:
+            shutdown_cached_backends()
 
     # ── Reading order ─────────────────────────────────────────────────────────
     t = _t()
@@ -631,14 +791,18 @@ def main() -> int:
         page_sizes=page_sizes,
     )
     timings.setdefault("reading_order", []).append(time.perf_counter() - t)
-    print(f"\n  Reading order: {len(reading_order.ordered_balloon_ids)} story balloon(s)")
+    print(
+        f"\n  Reading order: {len(reading_order.ordered_balloon_ids)} story balloon(s)"
+    )
 
     # ── Cross-page character identity ─────────────────────────────────────────
     t = _t()
     crops_by_character: dict = {}
     try:
         # Gather all crop paths from char_crop_store
-        for char_id_dir in (smoke_root / "char_crops" / args.sequence_id).rglob("character.png"):
+        for char_id_dir in (smoke_root / "char_crops" / args.sequence_id).rglob(
+            "character.png"
+        ):
             char_id = char_id_dir.parent.name
             face_path = char_id_dir.parent / "face.png"
             body_path = char_id_dir.parent / "body.png"
@@ -653,9 +817,7 @@ def main() -> int:
     identity_resolver = CharacterIdentityResolver(
         provider=backends["embedding_provider"],
     )
-    identity = identity_resolver.resolve(
-        args.sequence_id, pages, crops_by_character
-    )
+    identity = identity_resolver.resolve(args.sequence_id, pages, crops_by_character)
     timings.setdefault("identity", []).append(time.perf_counter() - t)
     print(
         f"  Identity: {len(identity.clusters)} cluster(s), "
@@ -676,6 +838,153 @@ def main() -> int:
     )
     timings.setdefault("resolver", []).append(time.perf_counter() - t)
 
+    # Persist the complete identity/speaker chain for debugging real smoke
+    # runs.  This deliberately records internal provenance only; the public
+    # JSONL schema below remains unchanged.
+    decision_index = {
+        decision.balloon_id: decision
+        for page_result in speaker_results
+        for decision in page_result.decisions
+    }
+    balloon_index = {balloon.id: balloon for page in pages for balloon in page.balloons}
+    identity_state_by_id = {
+        cluster.identity_id: cluster.state for cluster in identity.clusters
+    }
+    comparison = []
+    for resolved in resolution.ordered_balloons:
+        decision = decision_index[resolved.balloon_id]
+        legacy_rule = decision.evidence.get("rule")
+        legacy_speaker = (
+            resolved.speaker_label
+            if legacy_rule
+            in {
+                "unique_tail_endpoint_inside_character",
+                "unique_near_tail_endpoint",
+                "only_visible_character_instance_in_panel",
+            }
+            else None
+        )
+        comparison.append(
+            {
+                "balloon_id": resolved.balloon_id,
+                "page_index": resolved.page_index,
+                "old_result": legacy_speaker or "UNKNOWN",
+                "new_result": resolved.speaker_label or "UNKNOWN",
+                "selected_character_id": resolved.speaker_character_instance_id,
+                "method": decision.method,
+                "confidence": decision.confidence,
+                "score": decision.evidence.get("selected_score"),
+                "runner_up_score": decision.evidence.get("runner_up_score"),
+                "score_margin": decision.evidence.get("score_margin"),
+                "reason": decision.evidence.get("rule")
+                or decision.evidence.get("rejection_reason"),
+            }
+        )
+    trace = {
+        "sequence_id": args.sequence_id,
+        "characters": [
+            {
+                "character_id": character.id,
+                "page_index": page.page_index,
+                "bbox": character.bbox.model_dump(mode="json"),
+                "identity_cluster_id": identity.character_to_identity.get(character.id),
+                "label": identity.character_to_label.get(character.id),
+            }
+            for page in pages
+            for character in page.characters
+        ],
+        "identity_edges": [
+            {
+                "source": evidence.first_character_id,
+                "target": evidence.second_character_id,
+                "score": evidence.combined_score,
+                "confidence": evidence.confidence,
+                "method": evidence.method,
+                "same_page": evidence.same_page,
+                "first_page_index": evidence.first_page_index,
+                "second_page_index": evidence.second_page_index,
+                "similarities": {
+                    "full": evidence.full_similarity,
+                    "face": evidence.face_similarity,
+                    "body": evidence.body_similarity,
+                },
+                "matched": (
+                    identity.character_to_identity.get(evidence.first_character_id)
+                    is not None
+                    and identity.character_to_identity.get(evidence.first_character_id)
+                    == identity.character_to_identity.get(evidence.second_character_id)
+                ),
+                "diagnostics": evidence.diagnostics,
+            }
+            for evidence in identity.pair_evidence
+        ],
+        "balloons": [
+            {
+                "balloon_id": resolved.balloon_id,
+                "page_index": resolved.page_index,
+                "panel_id": resolved.panel_id,
+                "text": resolved.text,
+                "balloon_bbox": balloon_index[resolved.balloon_id].bbox.model_dump(
+                    mode="json"
+                ),
+                "balloon_kind": balloon_index[resolved.balloon_id].kind,
+                "speaker_grounding_method": (
+                    decision_index.get(resolved.balloon_id).method
+                    if resolved.balloon_id in decision_index
+                    else None
+                ),
+                "speaker_grounding_confidence": (
+                    decision_index.get(resolved.balloon_id).confidence
+                    if resolved.balloon_id in decision_index
+                    else None
+                ),
+                "selected_character_id": resolved.speaker_character_instance_id,
+                "selected_identity_cluster_id": resolved.speaker_identity_id,
+                "selected_character_label": resolved.speaker_label,
+                "identity_state": resolved.identity_state,
+                "final_speaker": resolved.speaker_label,
+                "candidates": [
+                    {
+                        "character_id": candidate.character_instance_id,
+                        "evidence": candidate.evidence.model_dump(mode="json"),
+                    }
+                    for candidate in decision_index[resolved.balloon_id].candidates
+                ],
+                "grounding_evidence": decision_index[resolved.balloon_id].evidence,
+                "runner_up_character": (
+                    decision_index[resolved.balloon_id]
+                    .evidence.get("candidate_scores", [{}])[1]
+                    .get("character_id")
+                    if len(
+                        decision_index[resolved.balloon_id].evidence.get(
+                            "candidate_scores", []
+                        )
+                    )
+                    > 1
+                    else None
+                ),
+                "runner_up_score": (
+                    decision_index[resolved.balloon_id].evidence.get("runner_up_score")
+                ),
+                "grounding_diagnostics": [
+                    diagnostic.model_dump(mode="json")
+                    for diagnostic in decision_index[resolved.balloon_id].diagnostics
+                ],
+            }
+            for resolved in resolution.ordered_balloons
+        ],
+        "character_to_identity_mapping": identity.character_to_identity,
+        "character_to_label_mapping": identity.character_to_label,
+        "identity_state_by_id": identity_state_by_id,
+        "comparison": comparison,
+    }
+    trace_path = smoke_root / "speaker_identity_trace.json"
+    trace_path.write_text(json.dumps(trace, indent=2) + "\n", encoding="utf-8")
+    comparison_path = smoke_root / "speaker_grounding_comparison.json"
+    comparison_path.write_text(
+        json.dumps(comparison, indent=2) + "\n", encoding="utf-8"
+    )
+
     # ── Validation ────────────────────────────────────────────────────────────
     known_chars = {char.id for page in pages for char in page.characters}
     validation_errors = validate_sequence_resolution(
@@ -687,6 +996,9 @@ def main() -> int:
     # ── JSONL serialization ───────────────────────────────────────────────────
     jsonl_line = serialize_resolution_to_jsonl(resolution)
     parsed_submission = json.loads(jsonl_line)
+    submission_path = args.submission_path or (smoke_root / "submission.jsonl")
+    submission_path.parent.mkdir(parents=True, exist_ok=True)
+    submission_path.write_text(jsonl_line + "\n", encoding="utf-8")
 
     # Speaker contract validation
     all_speaker_valid = all(
@@ -719,19 +1031,49 @@ def main() -> int:
     print(f"    total: {total_chars}")
     for i, stats in enumerate(page_stats):
         print(f"    page {i}: {stats['characters']}")
+    print(f"    trace: {trace_path}")
+    print(f"    comparison: {comparison_path}")
+    for page in pages:
+        for character in page.characters:
+            print(
+                f"      {character.id}: page={page.page_index} "
+                f"bbox={character.bbox.model_dump(mode='json')} "
+                f"identity={identity.character_to_identity.get(character.id)!r} "
+                f"label={identity.character_to_label.get(character.id)!r}"
+            )
 
-    n_resolved   = sum(1 for d in resolution.ordered_balloons if d.speaker_label not in (None, "NARRATION") and d.identity_state != "null")
-    n_narration  = sum(1 for d in resolution.ordered_balloons if d.speaker_label == "NARRATION")
-    n_unresolved = sum(1 for d in resolution.ordered_balloons if d.speaker_label is None)
-    n_ambiguous  = sum(1 for d in resolution.ordered_balloons if d.identity_state == "ambiguous")
+    n_resolved = sum(
+        1
+        for d in resolution.ordered_balloons
+        if d.speaker_label not in (None, "NARRATION") and d.identity_state != "null"
+    )
+    n_narration = sum(
+        1 for d in resolution.ordered_balloons if d.speaker_label == "NARRATION"
+    )
+    n_unresolved = sum(
+        1 for d in resolution.ordered_balloons if d.speaker_label is None
+    )
+    n_ambiguous = sum(
+        1 for d in resolution.ordered_balloons if d.identity_state == "ambiguous"
+    )
     print("\n  SPEAKERS:")
     print(f"    resolved:   {n_resolved}")
     print(f"    narration:  {n_narration}")
     print(f"    unresolved: {n_unresolved}")
     print(f"    ambiguous:  {n_ambiguous}")
+    print("\n  SPEAKER/IDENTITY TRACE:")
+    for item in trace["balloons"]:
+        print(
+            f"    {item['balloon_id']}: page={item['page_index']} "
+            f"method={item['speaker_grounding_method']!r} "
+            f"confidence={item['speaker_grounding_confidence']!r} "
+            f"character={item['selected_character_id']!r} "
+            f"identity={item['selected_identity_cluster_id']!r} "
+            f"speaker={item['final_speaker']!r}"
+        )
 
-    n_matched   = sum(1 for c in identity.clusters if c.state == "matched")
-    n_amb_id    = sum(1 for c in identity.clusters if c.state == "ambiguous")
+    n_matched = sum(1 for c in identity.clusters if c.state == "matched")
+    n_amb_id = sum(1 for c in identity.clusters if c.state == "ambiguous")
     n_unmatched = sum(1 for c in identity.clusters if c.state == "unmatched")
     print("\n  IDENTITIES:")
     print(f"    clusters:   {len(identity.clusters)}")
@@ -764,6 +1106,7 @@ def main() -> int:
     print(f"    all text strings valid:    {all_text_valid}")
     total_items = sum(len(p) for p in parsed_submission["pages"])
     print(f"    total serialized items:  {total_items}")
+    print(f"    verified JSONL path:     {submission_path}")
 
     print(f"\n  VALIDATION:  {len(validation_errors)} error(s)")
     for err in validation_errors:
@@ -773,21 +1116,63 @@ def main() -> int:
 
     print("\n  APPROXIMATE STAGE RUNTIMES (sum over all pages):")
     stage_names = {
-        "ctd":          "CTD localization",
-        "layout":       "Layout/balloon grouping",
-        "ctd_crops":    "CTD crops",
-        "ocr":          "OCR/Qwen proposals",
+        "backend_init": "Backend initialization",
+        "image_loading": "Image loading",
+        "ctd": "CTD localization",
+        "ctd_preprocessing_s": "CTD preprocessing",
+        "ctd_inference_s": "CTD inference",
+        "ctd_postprocessing_s": "CTD postprocessing",
+        "layout": "Layout/balloon grouping",
+        "ctd_crops": "CTD crops",
+        "ocr": "OCR/Qwen proposals",
         "adjudication": "Qwen adjudication",
-        "char_detect":  "Character detection",
-        "reading_order":"Reading order",
-        "identity":     "Character identity",
-        "resolver":     "Sequence resolver",
+        "char_detect": "Character detection",
+        "reading_order": "Reading order",
+        "identity": "Character identity",
+        "resolver": "Sequence resolver",
     }
     for key, label in stage_names.items():
         vals = timings.get(key, [])
         if vals:
             total = sum(vals)
             print(f"    {label:<28}: {total:.2f}s  (n={len(vals)})")
+
+    # Persist measured timings so optimization decisions can be based on an
+    # actual run.  Stages skipped by CLI flags are intentionally absent rather
+    # than reported as zero; this prevents a partial smoke run being mistaken
+    # for a full-model benchmark.
+    profile = {
+        "sequence_id": args.sequence_id,
+        "image_count": len(image_files),
+        "ctd_backend": getattr(
+            getattr(backends.get("ctd_localizer"), "detector", None),
+            "backend",
+            None,
+        ),
+        "ctd_execution_provider": getattr(
+            getattr(backends.get("ctd_localizer"), "detector", None),
+            "execution_provider",
+            None,
+        ),
+        "notes": [
+            "Measured wall-clock stage timings for this smoke invocation.",
+            "Absent stages were unavailable or skipped; they are not zero-cost.",
+            "Run without --skip-* flags for a full-model latency measurement.",
+        ],
+        "stages": {},
+    }
+    for key, values in timings.items():
+        profile["stages"][key] = {
+            "calls": len(values),
+            "total_ms": round(sum(values) * 1000.0, 3),
+            "avg_ms": round(sum(values) * 1000.0 / len(values), 3),
+            "p50_ms": round(_percentile(values, 0.50), 3),
+            "p95_ms": round(_percentile(values, 0.95), 3),
+        }
+    profile_path = smoke_root / "latency_profile.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+    print(f"    latency profile: {profile_path}")
 
     print()
     print(_hr())
@@ -809,14 +1194,20 @@ def main() -> int:
         for item in page_items:
             if count >= 3:
                 break
-            print(f"    page {pi}: speaker={item['speaker']!r}  text={textwrap.shorten(item['text'], 50)!r}")
+            print(
+                f"    page {pi}: speaker={item['speaker']!r}  text={textwrap.shorten(item['text'], 50)!r}"
+            )
             count += 1
         if count >= 3:
             break
 
     print()
     print(_hr())
-    verdict = "PASS" if not validation_errors else f"FAIL ({len(validation_errors)} validation error(s))"
+    verdict = (
+        "PASS"
+        if not validation_errors
+        else f"FAIL ({len(validation_errors)} validation error(s))"
+    )
     print(f"  RESULT: {verdict}")
     print(_hr())
     return 0 if not validation_errors else 1

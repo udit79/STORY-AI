@@ -11,7 +11,7 @@ Pipeline:
         ↓
     constrained clustering  (at most one instance per page per cluster)
         ↓
-    anonymous deterministic labels  (A, B, C, …)
+    anonymous deterministic labels  (Character A, Character B, …)
         ↓
     SequenceCharacterIdentity
 
@@ -225,9 +225,17 @@ class _IdentityGraph:
         # (id_a, id_b) → evidence, with id_a < id_b (canonical key order)
         self._edges: dict[tuple[str, str], CharacterPairEvidence] = {}
         self._nodes: dict[str, int] = {}  # id → page_index
+        self._order: dict[str, tuple[Any, ...]] = {}
 
-    def add_node(self, character_id: str, page_index: int) -> None:
+    def add_node(
+        self,
+        character_id: str,
+        page_index: int,
+        *,
+        order: tuple[Any, ...] | None = None,
+    ) -> None:
         self._nodes[character_id] = page_index
+        self._order[character_id] = order or (page_index, character_id)
 
     def add_or_update_edge(self, evidence: CharacterPairEvidence) -> None:
         key = tuple(sorted([evidence.first_character_id, evidence.second_character_id]))
@@ -256,6 +264,9 @@ class _IdentityGraph:
 
     def page_of(self, node_id: str) -> int | None:
         return self._nodes.get(node_id)
+
+    def order_of(self, node_id: str) -> tuple[Any, ...]:
+        return self._order.get(node_id, (9999, node_id))
 
 
 # ---------------------------------------------------------------------------
@@ -396,9 +407,9 @@ def _assign_labels(
     """Build CharacterIdentityCluster list with deterministic anonymous labels.
 
     Ordering rule:
-    - For each component, find the minimum (page_index, character_id) member.
+    - For each component, find the minimum sequence appearance key member.
     - Sort components by that key → ascending.
-    - Assign labels A, B, C, …, AA, AB, …
+    - Assign labels Character A, Character B, Character C, …
     """
 
     def _label(n: int) -> str:
@@ -412,11 +423,7 @@ def _assign_labels(
         return result
 
     def _min_key(member_ids: list[str]) -> tuple[int, str]:
-        keys = []
-        for cid in member_ids:
-            page = graph.page_of(cid)
-            keys.append((page if page is not None else 9999, cid))
-        return min(keys)
+        return min(graph.order_of(cid) for cid in member_ids)
 
     sorted_components = sorted(
         components.values(),
@@ -433,7 +440,7 @@ def _assign_labels(
     }
 
     for idx, member_ids in enumerate(sorted_components):
-        label = _label(idx)
+        label = f"Character {_label(idx)}"
         identity_id = f"identity-{idx + 1:03d}"
 
         members = []
@@ -520,9 +527,18 @@ class CharacterIdentityResolver:
 
         # --- build a flat list of (character, page_index) ---
         all_chars: list[tuple[CharacterInstance, int]] = []
+        character_order: dict[str, tuple[Any, ...]] = {}
         for page in pages:
+            panel_order = {panel.id: index for index, panel in enumerate(page.panels)}
             for char in page.characters:
                 all_chars.append((char, page.page_index))
+                character_order[char.id] = (
+                    page.page_index,
+                    panel_order.get(char.panel_id, len(panel_order)),
+                    char.bbox.y1,
+                    char.bbox.x1,
+                    char.id,
+                )
 
         if not all_chars:
             return SequenceCharacterIdentity(
@@ -541,7 +557,7 @@ class CharacterIdentityResolver:
         # --- build identity graph ---
         graph = _IdentityGraph()
         for char, page_idx in all_chars:
-            graph.add_node(char.id, page_idx)
+            graph.add_node(char.id, page_idx, order=character_order[char.id])
 
         pair_evidence: list[CharacterPairEvidence] = []
 

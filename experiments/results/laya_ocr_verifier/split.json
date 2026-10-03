@@ -1,0 +1,15 @@
+{
+  "seed": 20261002,
+  "validation_sequence": "seq_952f154fb1505883",
+  "train_sequences": [
+    "seq_2032620aa4e4ac7f",
+    "seq_7db7a000adeceacf",
+    "seq_9032e5551cf1a9d2"
+  ],
+  "train_examples": 87,
+  "validation_examples": 46,
+  "train_positive": 30,
+  "train_negative": 57,
+  "validation_positive": 17,
+  "validation_negative": 29
+}

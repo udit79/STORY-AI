@@ -48,7 +48,7 @@ class CharacterIdentityCluster(BaseModel):
     """One resolved cross-page identity: a set of page-scoped character instances."""
 
     identity_id: str          # internal cluster identifier, stable within sequence
-    label: str                # anonymous label: "A", "B", "C", …
+    label: str                # anonymous label: "Character A", "Character B", …
     members: list[IdentityMember]
     confidence: float = Field(ge=0.0, le=1.0, default=1.0)
     state: Literal["matched", "unmatched", "ambiguous"] = "matched"
@@ -72,7 +72,7 @@ class SequenceCharacterIdentity(BaseModel):
     # flat map: character_instance_id → identity_id  (or None if unresolved)
     character_to_identity: dict[str, str | None]
 
-    # flat map: character_instance_id → anonymous label  (or None)
+    # flat map: character_instance_id → anonymous label (Character A, …) or None
     character_to_label: dict[str, str | None]
 
     # pairwise evidence that drove the graph

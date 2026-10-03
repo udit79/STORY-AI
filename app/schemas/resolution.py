@@ -85,7 +85,7 @@ class ResolvedIdentity(BaseModel):
     """One identity cluster as seen by the resolver."""
 
     identity_id: str
-    label: str              # anonymous label (A, B, C, …) or "NARRATION"
+    label: str              # anonymous label (Character A, Character B, …) or "NARRATION"
     state: Literal["matched", "unmatched", "ambiguous"]
     member_character_ids: list[str] = Field(default_factory=list)
     page_indices: list[int] = Field(default_factory=list)

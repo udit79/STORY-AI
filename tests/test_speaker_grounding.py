@@ -152,6 +152,60 @@ def test_missing_tail_and_multiple_characters_remains_unresolved_not_nearest_win
     assert decision.evidence["selection_rule"] == "distance alone never selects a speaker"
 
 
+def test_no_tail_strong_overlap_uses_multi_feature_relationship_score():
+    balloon = make_balloon()
+    characters = [
+        make_character("char-overlap", BoundingBox(x1=42, y1=12, x2=64, y2=70)),
+        make_character("char-other", BoundingBox(x1=70, y1=35, x2=95, y2=85)),
+    ]
+    candidates = generate_speaker_candidates(
+        balloon, characters, [], page_size=(120, 100)
+    )
+
+    decision = SpeakerResolver().resolve(balloon, candidates, tail_geometry=None)
+
+    assert decision.selected_character_instance_id == "char-overlap"
+    assert decision.method == "geometry"
+    assert decision.evidence["rule"] == "multi_feature_no_tail"
+    assert decision.evidence["score_margin"] >= 0.15
+    assert decision.confidence is not None
+
+
+def test_no_tail_similar_relationship_scores_remain_unknown():
+    balloon = make_balloon()
+    characters = [
+        make_character("char-left", BoundingBox(x1=42, y1=12, x2=64, y2=70)),
+        make_character("char-right", BoundingBox(x1=42, y1=12, x2=64, y2=70)),
+    ]
+    candidates = generate_speaker_candidates(
+        balloon, characters, [], page_size=(120, 100)
+    )
+
+    decision = SpeakerResolver().resolve(balloon, candidates, tail_geometry=None)
+
+    assert decision.selected_character_instance_id is None
+    assert decision.method == "unknown"
+    assert decision.evidence["rejection_reason"] == "insufficient_or_ambiguous_no_tail_evidence"
+
+
+def test_multi_feature_selection_is_independent_of_candidate_order():
+    balloon = make_balloon()
+    characters = [
+        make_character("char-selected", BoundingBox(x1=42, y1=12, x2=64, y2=70)),
+        make_character("char-other", BoundingBox(x1=70, y1=35, x2=95, y2=85)),
+    ]
+    candidates = generate_speaker_candidates(
+        balloon, characters, [], page_size=(120, 100)
+    )
+
+    first = SpeakerResolver().resolve(balloon, candidates, tail_geometry=None)
+    second = SpeakerResolver().resolve(balloon, list(reversed(candidates)), tail_geometry=None)
+
+    assert first.selected_character_instance_id == "char-selected"
+    assert second.selected_character_instance_id == "char-selected"
+    assert first.evidence["candidate_scores"] == second.evidence["candidate_scores"]
+
+
 def test_only_character_in_detected_panel_can_be_geometry_candidate():
     balloon = make_balloon(panel_id="panel-1")
     panel = Panel(

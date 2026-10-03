@@ -148,7 +148,7 @@ def load_qwen3vl_runner(
     local_files_only: bool = True,
     device_map: str = "auto",
     quantize_4bit: bool = True,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 128,
 ) -> Qwen3VLLocalRunner:
     """Load Qwen3-VL from the local Hugging Face cache only."""
     try:

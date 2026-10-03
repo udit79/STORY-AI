@@ -50,7 +50,7 @@ def _win_to_wsl(path: str | Path) -> str:
     if not drive:
         return str(p).replace("\\", "/")
     drive_letter = drive.rstrip(":").lower()
-    rest = str(p)[len(drive):].replace("\\", "/").lstrip("/")
+    rest = str(p)[len(drive) :].replace("\\", "/").lstrip("/")
     return f"/mnt/{drive_letter}/{rest}"
 
 
@@ -62,11 +62,11 @@ class NemotronWSLBridge:
     """Persistent Windows→WSL bridge for the Nemotron OCR worker."""
 
     # Paths used to start the worker inside WSL.
-    _VENV_PYTHON     = "/mnt/d/STORY-AI/.venv-nemotron/bin/python"
-    _WORKER_SCRIPT   = "/mnt/d/STORY-AI/tools/nemotron_worker.py"
-    _CUDA_HOME       = "/mnt/d/STORY-AI/.cuda/cuda-12.8"
-    _TORCH_HOME      = "/mnt/d/STORY-AI/.torch"
-    _NEMOTRON_SRC    = "/mnt/d/STORY-AI/nemotron-ocr-v2/nemotron-ocr/src"
+    _VENV_PYTHON = "/mnt/d/STORY-AI/.venv-nemotron/bin/python"
+    _WORKER_SCRIPT = "/mnt/d/STORY-AI/tools/nemotron_worker.py"
+    _CUDA_HOME = "/mnt/d/STORY-AI/.cuda/cuda-12.8"
+    _TORCH_HOME = "/mnt/d/STORY-AI/.torch"
+    _NEMOTRON_SRC = "/mnt/d/STORY-AI/nemotron-ocr-v2/nemotron-ocr/src"
 
     def __init__(
         self,
@@ -103,18 +103,36 @@ class NemotronWSLBridge:
         if model_dir is None:
             model_dir = "/mnt/d/STORY-AI/nemotron-ocr-v2/v2_english"
 
-        cmd = ["wsl", "-e", cls._VENV_PYTHON, cls._WORKER_SCRIPT,
-               "--model-dir", model_dir, "--merge-level", merge_level]
+        cmd = [
+            "wsl",
+            "-e",
+            cls._VENV_PYTHON,
+            cls._WORKER_SCRIPT,
+            "--model-dir",
+            model_dir,
+            "--merge-level",
+            merge_level,
+        ]
         if lang is not None and model_dir is None:
-            cmd = ["wsl", "-e", cls._VENV_PYTHON, cls._WORKER_SCRIPT,
-                   "--lang", lang, "--merge-level", merge_level]
+            cmd = [
+                "wsl",
+                "-e",
+                cls._VENV_PYTHON,
+                cls._WORKER_SCRIPT,
+                "--lang",
+                lang,
+                "--merge-level",
+                merge_level,
+            ]
 
         env = dict(os.environ)
-        env["PYTHONPATH"]       = cls._NEMOTRON_SRC
-        env["CUDA_HOME"]        = cls._CUDA_HOME
-        env["TORCH_HOME"]       = cls._TORCH_HOME
-        env["PATH"]             = cls._CUDA_HOME + "/bin:" + env.get("PATH", "")
-        env["LD_LIBRARY_PATH"]  = cls._CUDA_HOME + "/lib64:" + env.get("LD_LIBRARY_PATH", "")
+        env["PYTHONPATH"] = cls._NEMOTRON_SRC
+        env["CUDA_HOME"] = cls._CUDA_HOME
+        env["TORCH_HOME"] = cls._TORCH_HOME
+        env["PATH"] = cls._CUDA_HOME + "/bin:" + env.get("PATH", "")
+        env["LD_LIBRARY_PATH"] = (
+            cls._CUDA_HOME + "/lib64:" + env.get("LD_LIBRARY_PATH", "")
+        )
 
         try:
             proc = subprocess.Popen(
@@ -123,7 +141,7 @@ class NemotronWSLBridge:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
-                bufsize=1,       # line-buffered
+                bufsize=1,  # line-buffered
                 text=True,
                 encoding="utf-8",
             )
@@ -250,6 +268,54 @@ class NemotronWSLBridge:
                     f"Nemotron worker error for {wsl_path}: {resp.get('error', '?')}"
                 )
             return resp.get("predictions") or []
+
+    def ocr_batch(
+        self,
+        image_paths: list[str | Path],
+        merge_level: str | None = None,
+    ) -> list[list[dict[str, Any]]]:
+        """Run a batch in one worker/GPU call; order matches the inputs."""
+        if not image_paths:
+            return []
+        if self._proc.poll() is not None:
+            raise NemotronWSLBridgeError(
+                f"Nemotron worker has exited (returncode={self._proc.returncode}). Cannot process request."
+            )
+        wsl_paths = [_win_to_wsl(path) for path in image_paths]
+        req_id = str(uuid.uuid4())
+        request = {
+            "id": req_id,
+            "image_paths": wsl_paths,
+            "merge_level": merge_level or self._merge_level,
+        }
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(json.dumps(request) + "\n")
+        self._proc.stdin.flush()
+        assert self._proc.stdout is not None
+        while True:
+            line = self._proc.stdout.readline()
+            if not line:
+                rc = self._proc.poll()
+                raise NemotronWSLBridgeError(
+                    f"Nemotron worker stdout closed unexpectedly (rc={rc}). "
+                    f"Stderr tail: {self.worker_stderr[-5:]}"
+                )
+            try:
+                resp = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+            if resp.get("id") != req_id:
+                continue
+            if not resp.get("ok"):
+                raise NemotronWSLBridgeError(
+                    f"Nemotron batch worker error: {resp.get('error', '?')}"
+                )
+            predictions = resp.get("predictions") or []
+            if len(predictions) != len(image_paths):
+                raise NemotronWSLBridgeError(
+                    f"Nemotron returned {len(predictions)} batch outputs for {len(image_paths)} images"
+                )
+            return predictions
 
     def shutdown(self) -> None:
         """Send a shutdown request and wait for the worker to exit."""

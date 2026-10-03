@@ -4,12 +4,9 @@ import pytest
 from pydantic import ValidationError
 
 from app.candidate_bank import (
-    LayaInput,
-    LayaPolicyAdapter,
     build_candidate_bank,
     normalize_candidate,
     produce_candidate_bank,
-    to_laya_input,
 )
 from app.models.candidate_adapters import (
     NemotronCandidateAdapter,
@@ -208,63 +205,6 @@ def test_bank_rejects_candidates_for_unknown_regions():
         build_candidate_bank([make_region()], [make_candidate("wrong", region_id="other")])
 
 
-def test_laya_input_has_comparison_geometry_and_source_features():
-    group = build_candidate_bank(
-        [make_region()],
-        [
-            make_candidate("paddle", "ocr_base", "Hello there!"),
-            make_candidate("qwen", "qwen3_vl", "Hello there?"),
-        ],
-    ).groups[0]
-    laya_input = to_laya_input(group, page_size=(200, 100))
-
-    assert laya_input.candidate_count == 2
-    assert laya_input.source_presence["ocr_base"] is True
-    assert laya_input.source_presence["nemotron"] is False
-    assert laya_input.region_geometry.width == 100
-    assert laya_input.region_geometry.normalized_width == 0.5
-    assert laya_input.candidates[0].word_count == 2
-    assert laya_input.candidates[0].normalized_text_similarity["qwen"] > 0.8
-    assert laya_input.candidates[0].spatial_consistency.region_iou is None
-
-
-def test_laya_adapter_passes_structured_input_and_requires_explicit_selection():
-    class Policy:
-        def predict(self, state, questions):
-            assert state["region_id"] == "ctd-17"
-            assert "raw_image" not in state
-            assert set(questions["select_transcription"]["criteria"]) == {
-                "paddle", "qwen"
-            }
-            return {
-                "selected_candidate_id": "qwen",
-                "decision_confidence": 0.7,
-                "reason": "visual support",
-                "features": {"agreement": 0.8},
-            }
-
-    group = build_candidate_bank(
-        [make_region()],
-        [make_candidate("paddle"), make_candidate("qwen", "qwen3_vl")],
-    ).groups[0]
-    decision = LayaPolicyAdapter(Policy()).decide(to_laya_input(group))
-
-    assert decision.region_id == group.region_id
-    assert decision.selected_candidate_id == "qwen"
-    assert decision.decision_confidence == 0.7
-    assert decision.features_used == {"agreement": 0.8}
-
-
-def test_laya_rejects_unrecognized_or_non_candidate_selection():
-    class Policy:
-        def predict(self, state, questions):
-            return {"selected_candidate_id": "invented"}
-
-    group = build_candidate_bank([make_region()], [make_candidate("paddle")]).groups[0]
-    with pytest.raises(ValueError, match="explicitly select"):
-        LayaPolicyAdapter(Policy()).decide(to_laya_input(group))
-
-
 def test_end_to_end_candidate_path_uses_same_ctd_region_for_each_producer(tmp_path):
     region = make_region()
     crop_path = tmp_path / "ctd-17.png"
@@ -282,14 +222,11 @@ def test_end_to_end_candidate_path_uses_same_ctd_region_for_each_producer(tmp_pa
         ),
     )
     bank = produce_candidate_bank([region], {region.id: crop_path}, producer_list)
-    laya_input: LayaInput = to_laya_input(bank.groups[0])
 
     assert bank.groups[0].region_id == region.id
     assert {candidate.source for candidate in bank.groups[0].candidates} == {
         "ocr_base", "nemotron", "qwen3_vl"
     }
-    assert laya_input.candidate_count == 3
-    assert laya_input.source_presence["qwen3_vl"] is True
 
 
 def test_preprocessing_variants_use_their_own_localized_crop(tmp_path):
@@ -310,16 +247,3 @@ def test_preprocessing_variants_use_their_own_localized_crop(tmp_path):
 
     assert seen_paths == [str(tmp_path / "upscale.png")]
     assert bank.groups[0].candidates[0].source == "ocr_upscale"
-
-
-def test_laya_input_preserves_source_specific_evidence():
-    candidate = normalize_candidate(
-        make_region(),
-        "qwen3_vl",
-        {"transcription": "Hello!", "extra_evidence": {"marker": "kept"}},
-    )
-    group = build_candidate_bank([make_region()], [candidate]).groups[0]
-
-    assert to_laya_input(group).candidates[0].source_metadata["extra_evidence"] == {
-        "marker": "kept"
-    }

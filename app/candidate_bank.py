@@ -1,6 +1,6 @@
-"""Build CTD-owned candidate groups and structured input for Laya.
+"""Build CTD-owned candidate groups and structured evidence for adjudication.
 
-This module stops at transcription evidence and policy decisions. It does not
+This module stops at transcription evidence. It does not
 filter story text, establish reading order, or resolve speakers or characters.
 """
 
@@ -8,12 +8,9 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from difflib import SequenceMatcher
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
-
-from pydantic import BaseModel, Field
 
 from app.schemas.candidates import (
     CandidateBank,
@@ -255,20 +252,6 @@ def normalize_candidate(
     )
 
 
-def _candidate_text_key(text: str) -> str:
-    return re.sub(r"\s+", " ", text.upper()).strip()
-
-
-def _bbox_iou(a: BoundingBox, b: BoundingBox) -> float:
-    intersection_width = max(0.0, min(a.x2, b.x2) - max(a.x1, b.x1))
-    intersection_height = max(0.0, min(a.y2, b.y2) - max(a.y1, b.y1))
-    intersection = intersection_width * intersection_height
-    area_a = max(0.0, a.x2 - a.x1) * max(0.0, a.y2 - a.y1)
-    area_b = max(0.0, b.x2 - b.x1) * max(0.0, b.y2 - b.y1)
-    union = area_a + area_b - intersection
-    return intersection / union if union else 0.0
-
-
 def build_candidate_bank(
     regions: Iterable[TextRegion],
     candidates: Iterable[TranscriptionCandidate],
@@ -346,220 +329,3 @@ def produce_candidate_bank(
                 crop_path = Path(region_crops)
             candidates.extend(producer.candidates(region, crop_path))
     return build_candidate_bank(region_list, candidates)
-
-
-class RegionGeometry(BaseModel):
-    width: float
-    height: float
-    area: float
-    aspect_ratio: float | None = None
-    normalized_width: float | None = None
-    normalized_height: float | None = None
-
-
-class CandidateSpatialFeatures(BaseModel):
-    region_iou: float | None = None
-    center_offset_x: float | None = None
-    center_offset_y: float | None = None
-
-
-class LayaCandidateInput(BaseModel):
-    candidate_id: str
-    source: CandidateSource
-    text: str
-    ocr_confidence: float | None = None
-    visual_confidence: float | None = None
-    candidate_supported: bool | None = None
-    text_type: str
-    preprocessing: str | None = None
-    notes: str | None = None
-    source_metadata: dict[str, Any] = Field(default_factory=dict)
-    text_length: int
-    character_count: int
-    word_count: int
-    bbox: BoundingBox | None = None
-    normalized_text_similarity: dict[str, float] = Field(default_factory=dict)
-    spatial_consistency: CandidateSpatialFeatures = Field(
-        default_factory=CandidateSpatialFeatures
-    )
-
-
-class LayaInput(BaseModel):
-    """Image-free, per-region evidence contract sent to the Laya policy."""
-
-    region_id: str
-    region_bbox: BoundingBox | None = None
-    region_geometry: RegionGeometry | None = None
-    candidate_count: int
-    source_presence: dict[str, bool]
-    candidates: list[LayaCandidateInput] = Field(min_length=1)
-
-
-def to_laya_input(
-    group: CandidateGroup,
-    *,
-    page_size: tuple[float, float] | None = None,
-) -> LayaInput:
-    """Compute deterministic comparison and geometry features for one group."""
-    box = group.bbox
-    geometry = None
-    if box is not None:
-        width = max(0.0, box.x2 - box.x1)
-        height = max(0.0, box.y2 - box.y1)
-        page_width, page_height = page_size or (None, None)
-        geometry = RegionGeometry(
-            width=width,
-            height=height,
-            area=width * height,
-            aspect_ratio=width / height if height else None,
-            normalized_width=width / page_width if page_width else None,
-            normalized_height=height / page_height if page_height else None,
-        )
-
-    source_presence = {
-        source: any(candidate.source == source for candidate in group.candidates)
-        for source in CANDIDATE_SOURCES
-    }
-    features: list[LayaCandidateInput] = []
-    for candidate in group.candidates:
-        similarities = {
-            other.candidate_id: SequenceMatcher(
-                None,
-                _candidate_text_key(candidate.text),
-                _candidate_text_key(other.text),
-                autojunk=False,
-            ).ratio()
-            for other in group.candidates
-            if other.candidate_id != candidate.candidate_id
-        }
-        spatial = CandidateSpatialFeatures()
-        if box is not None and candidate.bbox is not None:
-            region_width = max(0.0, box.x2 - box.x1)
-            region_height = max(0.0, box.y2 - box.y1)
-            candidate_center_x = (candidate.bbox.x1 + candidate.bbox.x2) / 2
-            candidate_center_y = (candidate.bbox.y1 + candidate.bbox.y2) / 2
-            region_center_x = (box.x1 + box.x2) / 2
-            region_center_y = (box.y1 + box.y2) / 2
-            spatial = CandidateSpatialFeatures(
-                region_iou=_bbox_iou(candidate.bbox, box),
-                center_offset_x=(candidate_center_x - region_center_x) / region_width
-                if region_width
-                else None,
-                center_offset_y=(candidate_center_y - region_center_y) / region_height
-                if region_height
-                else None,
-            )
-        features.append(
-            LayaCandidateInput(
-                candidate_id=candidate.candidate_id,
-                source=candidate.source,
-                text=candidate.text,
-                ocr_confidence=candidate.evidence.ocr_confidence,
-                visual_confidence=candidate.evidence.visual_confidence,
-                candidate_supported=candidate.evidence.candidate_supported,
-                text_type=candidate.evidence.semantic_type,
-                preprocessing=candidate.evidence.preprocessing,
-                notes=candidate.evidence.notes,
-                source_metadata=candidate.evidence.source_metadata,
-                text_length=len(candidate.text),
-                character_count=sum(not character.isspace() for character in candidate.text),
-                word_count=len(candidate.text.split()),
-                bbox=candidate.bbox,
-                normalized_text_similarity=similarities,
-                spatial_consistency=spatial,
-            )
-        )
-    return LayaInput(
-        region_id=group.region_id,
-        region_bbox=box,
-        region_geometry=geometry,
-        candidate_count=len(features),
-        source_presence=source_presence,
-        candidates=features,
-    )
-
-
-class LayaDecision(BaseModel):
-    region_id: str
-    selected_candidate_id: str
-    decision_confidence: float | None = None
-    reason: str | None = None
-    features_used: dict[str, Any] = Field(default_factory=dict)
-    raw_decision: dict[str, Any] = Field(default_factory=dict)
-
-
-def _default_laya_response(raw: Any) -> Mapping[str, Any] | str:
-    if isinstance(raw, str):
-        return raw
-    if isinstance(raw, Mapping):
-        return raw
-    model_dump = getattr(raw, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump()
-        if isinstance(dumped, Mapping):
-            return dumped
-    raise TypeError("Laya response must be a candidate ID or a mapping")
-
-
-class LayaPolicyAdapter:
-    """Bridge image-free region evidence to Laya's predict(state, questions) API."""
-
-    def __init__(
-        self,
-        policy: Any,
-        response_parser: Callable[[Any], Mapping[str, Any] | str] | None = None,
-    ) -> None:
-        self.policy = policy
-        self.response_parser = response_parser or _default_laya_response
-
-    def decide(self, laya_input: LayaInput) -> LayaDecision:
-        state = laya_input.model_dump(mode="json")
-        questions = {
-            "select_transcription": {
-                "type": "choice",
-                "instructions": (
-                    "Select the candidate transcription best supported by the "
-                    "structured evidence. Return its candidate_id exactly. "
-                    "Do not invent or rewrite a transcription."
-                ),
-                "criteria": {
-                    candidate.candidate_id: (
-                        f"source={candidate.source}; text={candidate.text}"
-                    )
-                    for candidate in laya_input.candidates
-                },
-            }
-        }
-        parsed = self.response_parser(self.policy.predict(state, questions))
-        if isinstance(parsed, str):
-            selected_id = parsed.strip()
-            response: Mapping[str, Any] = {}
-        else:
-            response = parsed
-            selected_id = response.get(
-                "selected_candidate_id",
-                response.get("candidate_id", response.get("select_transcription", "")),
-            )
-            if isinstance(selected_id, Mapping):
-                selected_id = selected_id.get("candidate_id", selected_id.get("choice", ""))
-            selected_id = str(selected_id).strip() if selected_id is not None else ""
-
-        candidate_ids = {candidate.candidate_id for candidate in laya_input.candidates}
-        if selected_id not in candidate_ids:
-            raise ValueError(
-                "Laya response must explicitly select one of the supplied candidate IDs"
-            )
-
-        confidence = _optional_confidence(
-            response.get("decision_confidence", response.get("confidence"))
-        )
-        reason = response.get("reason", response.get("notes"))
-        features_used = response.get("features_used", response.get("features", {}))
-        return LayaDecision(
-            region_id=laya_input.region_id,
-            selected_candidate_id=selected_id,
-            decision_confidence=confidence,
-            reason=str(reason) if reason is not None else None,
-            features_used=dict(features_used) if isinstance(features_used, Mapping) else {},
-            raw_decision=dict(response),
-        )

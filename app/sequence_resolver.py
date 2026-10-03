@@ -26,11 +26,16 @@ Competition output contract (from score.py / sample_submission.jsonl):
 
 from __future__ import annotations
 
+import re
 import string
 from typing import Any
 
 from app.schemas.adjudication import BalloonAdjudicationResult
-from app.schemas.character_identity import SequenceCharacterIdentity
+from app.schemas.character_identity import (
+    CharacterIdentityCluster,
+    IdentityMember,
+    SequenceCharacterIdentity,
+)
 from app.schemas.page import CharacterInstance, PageRepresentation
 from app.schemas.reading_order import SequenceReadingOrder
 from app.schemas.resolution import (
@@ -63,6 +68,114 @@ _NARRATION_TYPES: frozenset[str] = frozenset(
 
 # Speaker-attributed types: the speaker must come from identity resolution.
 _DIALOGUE_TYPES: frozenset[str] = frozenset(["dialogue", "unknown"])
+
+
+def _anonymous_label(label: str | None) -> str | None:
+    """Normalize legacy cluster labels without changing real character names."""
+    if label is not None and re.fullmatch(r"[A-Z]+", label):
+        return f"Character {label}"
+    return label
+
+
+def _alphabetic_label(index: int) -> str:
+    """0→A, 1→B, …, 25→Z, 26→AA."""
+    result = ""
+    index += 1
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        result = string.ascii_uppercase[remainder] + result
+    return f"Character {result}"
+
+
+def _ensure_grounded_singletons(
+    identity: SequenceCharacterIdentity | None,
+    pages: list[PageRepresentation],
+) -> SequenceCharacterIdentity | None:
+    """Materialize deterministic singleton identities for grounded characters.
+
+    The normal identity resolver already creates these clusters.  This small
+    reconciliation guard covers partial/legacy identity results where a
+    detected character is present in the flat map with ``None`` (or omitted),
+    so a successfully grounded anonymous speaker is not converted to UNKNOWN.
+    Existing cluster IDs and labels are preserved; new labels are appended in
+    sequence appearance order.
+    """
+    if identity is None:
+        return None
+
+    character_index = {
+        character.id: (page.page_index, character)
+        for page in pages
+        for character in page.characters
+    }
+    missing_ids = [
+        character_id
+        for character_id in character_index
+        if identity.character_to_identity.get(character_id) is None
+    ]
+    if not missing_ids:
+        return identity
+
+    missing_ids.sort(
+        key=lambda character_id: (
+            character_index[character_id][0],
+            character_index[character_id][1].bbox.y1,
+            character_index[character_id][1].bbox.x1,
+            character_id,
+        )
+    )
+    clusters = list(identity.clusters)
+    character_to_identity = dict(identity.character_to_identity)
+    character_to_label = dict(identity.character_to_label)
+    used_identity_ids = {cluster.identity_id for cluster in clusters}
+    used_labels = {cluster.label for cluster in clusters}
+    next_identity_number = max(
+        [
+            int(match.group(1))
+            for match in (
+                re.fullmatch(r"identity-(\d+)", identity_id)
+                for identity_id in used_identity_ids
+            )
+            if match is not None
+        ],
+        default=0,
+    ) + 1
+    next_label_index = 0
+    while _alphabetic_label(next_label_index) in used_labels:
+        next_label_index += 1
+
+    for character_id in missing_ids:
+        page_index, character = character_index[character_id]
+        while f"identity-{next_identity_number:03d}" in used_identity_ids:
+            next_identity_number += 1
+        identity_id = f"identity-{next_identity_number:03d}"
+        label = _alphabetic_label(next_label_index)
+        while label in used_labels:
+            next_label_index += 1
+            label = _alphabetic_label(next_label_index)
+        clusters.append(CharacterIdentityCluster(
+            identity_id=identity_id,
+            label=label,
+            members=[IdentityMember(
+                character_id=character_id,
+                page_index=page_index,
+                panel_id=character.panel_id,
+            )],
+            confidence=1.0,
+            state="unmatched",
+        ))
+        character_to_identity[character_id] = identity_id
+        character_to_label[character_id] = label
+        used_identity_ids.add(identity_id)
+        used_labels.add(label)
+        next_identity_number += 1
+        next_label_index += 1
+
+    return identity.model_copy(update={
+        "clusters": clusters,
+        "character_to_identity": character_to_identity,
+        "character_to_label": character_to_label,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +302,7 @@ def _resolve_speaker_label(
         return None, None, "unmatched"
 
     identity_id = identity.character_to_identity.get(speaker_char_id)
-    label = identity.character_to_label.get(speaker_char_id)
+    label = _anonymous_label(identity.character_to_label.get(speaker_char_id))
 
     if identity_id is None:
         # Character exists but was not assigned to any cluster
@@ -416,7 +529,7 @@ def _build_resolved_identities(
         page_indices = sorted({m.page_index for m in cluster.members})
         result.append(ResolvedIdentity(
             identity_id=cluster.identity_id,
-            label=cluster.label,
+            label=_anonymous_label(cluster.label) or cluster.label,
             state=cluster.state,
             member_character_ids=[m.character_id for m in cluster.members],
             page_indices=page_indices,
@@ -467,6 +580,7 @@ class SequenceConsistencyResolver:
         char_index = _build_page_character_index(pages)
         balloon_page_index = _build_balloon_page_index(pages)
         balloon_panel_index = _build_balloon_panel_index(pages)
+        identity = _ensure_grounded_singletons(identity, pages)
 
         # --- pre-resolution consistency checks ---
         _check_adjudication_coverage(reading_order, adj_index, diagnostics)

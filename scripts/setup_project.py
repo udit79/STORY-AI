@@ -42,7 +42,6 @@ REQUIRED_DIRS = [
     "app",
     "app/models",
     "app/schemas",
-    "app/langgraph_nodes",
     "app/data",
     "config",
     "dataset",

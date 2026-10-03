@@ -429,7 +429,7 @@ def test_anonymous_labels_are_A_B_C_in_order():
     resolver = CharacterIdentityResolver(NullEmbeddingProvider())
     result = resolver.resolve("seq", pages)
     labels = sorted(cl.label for cl in result.clusters)
-    assert labels == ["A", "B", "C"]
+    assert labels == ["Character A", "Character B", "Character C"]
 
 
 def test_label_generator_beyond_Z():
@@ -444,8 +444,8 @@ def test_label_generator_beyond_Z():
         components, graph, ambiguity_low=0.45, ambiguity_high=0.65
     )
     labels = [cl.label for cl in clusters]
-    assert labels[25] == "Z"
-    assert labels[26] == "AA"
+    assert labels[25] == "Character Z"
+    assert labels[26] == "Character AA"
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ ValidationError objects.  An empty list means the resolution passed all checks.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -174,7 +175,10 @@ def _rule_speaker_label_maps_to_valid_identity(
 ) -> list[ValidationError]:
     """speaker_label (when set and not NARRATION) must map to a valid identity in identities."""
     errors: list[ValidationError] = []
-    valid_labels = {ident.label for ident in resolution.identities}
+    valid_labels = {
+        f"Character {ident.label}" if re.fullmatch(r"[A-Z]+", ident.label) else ident.label
+        for ident in resolution.identities
+    }
     valid_labels.add("NARRATION")
     for balloon in resolution.ordered_balloons:
         label = balloon.speaker_label

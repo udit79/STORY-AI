@@ -40,7 +40,7 @@ Historical, detailed versions remain in [docs/archive/](docs/archive/).
 
 **Evidence.** The architecture supports independent provenance, deterministic crop identities, explicit ambiguity, sequence-local character labels, and schema-level diagnostics.
 
-**Decision.** Qwen3-VL is the image-primary balloon adjudicator. Geometry and visual context ground speakers; identity is a sequence-local graph; LangGraph remains orchestration only.
+**Decision.** Qwen3-VL is the image-primary balloon adjudicator. Geometry and visual context ground speakers; identity is a sequence-local graph. The current runtime is orchestrated procedurally by the Python pipeline entry point; LangGraph is not used.
 
 **Next gate.** Run labelled development evaluation and report text, order, speaker, identity, and contract metrics separately.
 
@@ -54,14 +54,14 @@ Historical, detailed versions remain in [docs/archive/](docs/archive/).
 
 ## Research status
 
-| Area | Status | Evidence or next action |
-|---|---|---|
-| Data and schemas | Complete | Regression-covered contracts |
-| CTD localization | Integrated | Local ONNX detector |
-| Layout and balloon grouping | Integrated | YOLO plus geometry fallback |
-| Candidate Bank | Integrated | Independent provenance preserved |
-| Qwen adjudication | Integrated | Balloon-level image-primary decision |
-| Character and speaker reasoning | Integrated | Regression-covered |
-| Identity and sequence resolution | Integrated | Zero diagnostics in baseline |
-| Development-set evaluation | Next gate | Run official scorer and error taxonomy |
-| Runtime instrumentation | Open | Add per-model, per-stage timings |
+| Area                             | Status     | Evidence or next action                |
+| -------------------------------- | ---------- | -------------------------------------- |
+| Data and schemas                 | Complete   | Regression-covered contracts           |
+| CTD localization                 | Integrated | Local ONNX detector                    |
+| Layout and balloon grouping      | Integrated | YOLO plus geometry fallback            |
+| Candidate Bank                   | Integrated | Independent provenance preserved       |
+| Qwen adjudication                | Integrated | Balloon-level image-primary decision   |
+| Character and speaker reasoning  | Integrated | Regression-covered                     |
+| Identity and sequence resolution | Integrated | Zero diagnostics in baseline           |
+| Development-set evaluation       | Next gate  | Run official scorer and error taxonomy |
+| Runtime instrumentation          | Open       | Add per-model, per-stage timings       |

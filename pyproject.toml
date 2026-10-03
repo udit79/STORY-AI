@@ -14,11 +14,7 @@ dependencies = [
     "paddleocr>=3.7.0",
     "pyclipper>=1.4.0",
     "pydantic>=2.13.5",
-    "pytest>=9.1.1",
     "qwen-vl-utils>=0.0.14",
-    "rapidfuzz>=3.14.6",
-    "ruff>=0.16.9",
-    "scikit-learn>=1.9.1",
     "setuptools<81",
     "shapely>=2.1.2",
     "torch==2.5.1",
@@ -30,8 +26,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = [
+    "httpx2>=2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]
+api = [
+    "fastapi>=0.115,<1",
+    "python-multipart>=0.0.9",
+    "uvicorn>=0.30,<1",
+]
 manga-layout = [
     "ultralytics>=8.3.0,<9.0.0",
+]
+research = [
+    "rapidfuzz>=3.14.6",
+    "scikit-learn>=1.9.1",
 ]
 
 [tool.uv.sources]

@@ -39,6 +39,8 @@ class SpeakerCandidateEvidence(BaseModel):
     center_distance_px: float | None = None
     normalized_center_distance: float | None = None
     balloon_character_overlap: float | None = None
+    normalized_bbox_distance: float | None = None
+    normalized_face_distance: float | None = None
     tail_endpoint_distance_px: float | None = None
     normalized_tail_endpoint_distance: float | None = None
     tail_endpoint_inside_character: bool | None = None
@@ -119,6 +121,13 @@ def _intersection_area(first: BoundingBox, second: BoundingBox) -> float:
 def _point_bbox_distance(point: Point2D, bbox: BoundingBox) -> float:
     dx = max(bbox.x1 - point.x, 0.0, point.x - bbox.x2)
     dy = max(bbox.y1 - point.y, 0.0, point.y - bbox.y2)
+    return math.hypot(dx, dy)
+
+
+def _bbox_distance(first: BoundingBox, second: BoundingBox) -> float:
+    """Minimum Euclidean distance between two axis-aligned boxes."""
+    dx = max(first.x1 - second.x2, second.x1 - first.x2, 0.0)
+    dy = max(first.y1 - second.y2, second.y1 - first.y2, 0.0)
     return math.hypot(dx, dy)
 
 
@@ -244,6 +253,15 @@ def generate_speaker_candidates(
         intersection = _intersection_area(balloon.bbox, character.bbox)
         smaller_area = min(_area(balloon.bbox), _area(character.bbox))
         overlap = intersection / smaller_area if smaller_area > 0 else 0.0
+        bbox_distance = _bbox_distance(balloon.bbox, character.bbox)
+        face_distance = (
+            _point_bbox_distance(
+                Point2D(x=balloon_center[0], y=balloon_center[1]),
+                character.face_bbox,
+            )
+            if character.face_bbox is not None and _valid_bbox(character.face_bbox)
+            else None
+        )
         tail_distance = None
         tail_inside = None
         alignment = None
@@ -273,6 +291,14 @@ def generate_speaker_candidates(
                         center_distance / page_diagonal if page_diagonal else None
                     ),
                     balloon_character_overlap=overlap,
+                    normalized_bbox_distance=(
+                        bbox_distance / page_diagonal if page_diagonal else None
+                    ),
+                    normalized_face_distance=(
+                        face_distance / page_diagonal
+                        if face_distance is not None and page_diagonal
+                        else None
+                    ),
                     tail_endpoint_distance_px=tail_distance,
                     normalized_tail_endpoint_distance=(
                         tail_distance / page_diagonal
@@ -418,6 +444,94 @@ class SpeakerResolver:
         self.visual_acceptance_threshold = visual_acceptance_threshold
         self.tail_geometry_provider = tail_geometry_provider or MaskPolygonTailGeometryProvider()
 
+    @staticmethod
+    def _no_tail_score(candidate: SpeakerCandidate) -> tuple[float, dict[str, float]]:
+        """Score independent geometric relationships when no tail is usable.
+
+        Overlap and bbox proximity are deliberately bounded contributions: a
+        nearest-center candidate without overlap cannot pass the acceptance
+        gate below.  The returned feature map is persisted in diagnostics so
+        decisions remain inspectable.
+        """
+        evidence = candidate.evidence
+        features: dict[str, float] = {}
+        if evidence.balloon_character_overlap is not None:
+            features["overlap"] = min(1.0, evidence.balloon_character_overlap / 0.75)
+        if evidence.normalized_bbox_distance is not None:
+            features["bbox_proximity"] = max(
+                0.0, 1.0 - evidence.normalized_bbox_distance / 0.15
+            )
+        if evidence.normalized_face_distance is not None:
+            features["face_proximity"] = max(
+                0.0, 1.0 - evidence.normalized_face_distance / 0.25
+            )
+        if evidence.same_panel is True:
+            features["same_panel"] = 1.0
+
+        weights = {
+            "overlap": 0.55,
+            "bbox_proximity": 0.20,
+            "face_proximity": 0.15,
+            "same_panel": 0.10,
+        }
+        score = sum(weights[name] * value for name, value in features.items())
+        return score, features
+
+    @classmethod
+    def _resolve_no_tail_geometry(
+        cls,
+        candidate_list: list[SpeakerCandidate],
+        base_evidence: dict[str, Any],
+    ) -> SpeakerDecision | None:
+        ranked = sorted(
+            ((cls._no_tail_score(candidate), candidate) for candidate in candidate_list),
+            key=lambda item: (-item[0][0], item[1].character_instance_id),
+        )
+        if not ranked:
+            return None
+        (best_score, best_features), best_candidate = ranked[0]
+        runner_up_score = ranked[1][0][0] if len(ranked) > 1 else 0.0
+        margin = best_score - runner_up_score
+        normalized_overlap = best_features.get("overlap", 0.0)
+        has_strong_overlap = normalized_overlap >= 0.65
+        accepted = best_score >= 0.60 and margin >= 0.15 and (
+            has_strong_overlap or best_candidate.evidence.same_panel is True
+        )
+        ranking = [
+            {
+                "character_id": candidate.character_instance_id,
+                "score": score,
+                "features": features,
+            }
+            for (score, features), candidate in ranked
+        ]
+        evidence = {
+            **base_evidence,
+            "rule": "multi_feature_no_tail",
+            "candidate_scores": ranking,
+            "selected_score": best_score,
+            "runner_up_score": runner_up_score,
+            "score_margin": margin,
+            "acceptance_threshold": 0.60,
+            "margin_threshold": 0.15,
+        }
+        if not accepted:
+            return SpeakerDecision(
+                balloon_id=best_candidate.balloon_id,
+                method="unknown",
+                candidates=candidate_list,
+                evidence={**evidence, "rejection_reason": "insufficient_or_ambiguous_no_tail_evidence"},
+            )
+        confidence = min(0.99, max(0.0, 0.5 + 0.5 * min(1.0, best_score + margin)))
+        return SpeakerDecision(
+            balloon_id=best_candidate.balloon_id,
+            selected_character_instance_id=best_candidate.character_instance_id,
+            confidence=confidence,
+            method="geometry",
+            candidates=candidate_list,
+            evidence=evidence,
+        )
+
     def resolve(
         self,
         balloon: Balloon,
@@ -501,6 +615,18 @@ class SpeakerResolver:
                 },
             )
 
+        if tail_geometry is None:
+            no_tail_decision = self._resolve_no_tail_geometry(candidate_list, base_evidence)
+            if no_tail_decision is not None and no_tail_decision.selected_character_instance_id is not None:
+                return no_tail_decision
+            no_tail_evidence = (
+                no_tail_decision.evidence
+                if no_tail_decision is not None
+                else {**base_evidence, "rejection_reason": "no_candidates"}
+            )
+        else:
+            no_tail_evidence = base_evidence
+
         if self.visual_grounder is not None and visual_context is not None:
             visual = self.visual_grounder.resolve(balloon.id, candidate_list, visual_context)
             diagnostics.extend(visual.diagnostics)
@@ -541,7 +667,7 @@ class SpeakerResolver:
             balloon_id=balloon.id,
             method="unknown",
             candidates=candidate_list,
-            evidence=base_evidence,
+            evidence=no_tail_evidence,
             diagnostics=diagnostics,
         )
 

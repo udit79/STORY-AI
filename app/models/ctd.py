@@ -76,6 +76,45 @@ def _actual_confidence(block: Any) -> float | None:
     return None
 
 
+class _OnnxRuntimeNet:
+    """Small OpenCV-DNN-compatible wrapper backed by local ONNX Runtime."""
+
+    def __init__(self, model_path: Path, fallback_net: Any) -> None:
+        import onnxruntime as ort
+
+        available = ort.get_available_providers()
+        providers = [
+            provider
+            for provider in ("CUDAExecutionProvider", "CPUExecutionProvider")
+            if provider in available
+        ]
+        if not providers:
+            raise RuntimeError("ONNX Runtime has no usable execution provider")
+        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        self.execution_provider = self.session.get_providers()[0]
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+        self.input_blob: Any | None = None
+        self.fallback_net = fallback_net
+        self.fallback_output_names = fallback_net.getUnconnectedOutLayersNames()
+
+    def setInput(self, blob: Any) -> None:  # noqa: N802 - mirrors cv2.dnn.Net
+        self.input_blob = blob
+
+    def forward(self, output_names: list[str]) -> list[Any]:
+        if self.input_blob is None:
+            raise RuntimeError("CTD input was not set")
+        try:
+            return self.session.run(
+                output_names,
+                {self.input_name: self.input_blob},
+            )
+        except Exception:  # noqa: BLE001 - retry on the original OpenCV CPU net
+            self.fallback_net.setInput(self.input_blob)
+            self.execution_provider = "OpenCV-DNN-CPU fallback"
+            return self.fallback_net.forward(self.fallback_output_names)
+
+
 class CTDPageLocalizer:
     """Convert the vendored TextDetector's block output into validated regions."""
 
@@ -89,6 +128,11 @@ class CTDPageLocalizer:
         if image is None:
             raise FileNotFoundError(f"Unable to read page image: {path}")
         _, _, blocks = self.detector(image)
+        runtime_net = getattr(getattr(self.detector, "net", None), "model", None)
+        if getattr(runtime_net, "execution_provider", None):
+            self.detector.execution_provider = runtime_net.execution_provider
+            if runtime_net.execution_provider.startswith("OpenCV-DNN-CPU"):
+                self.detector.backend = "opencv"
         regions: list[TextRegion] = []
         for source_index, block in suppress_duplicate_ctd_blocks(
             list(blocks or []), self.duplicate_iou_threshold
@@ -122,8 +166,19 @@ def load_ctd_detector(
         from inference import TextDetector
     except ImportError as exc:
         raise RuntimeError("Unable to import the vendored CTD implementation") from exc
-    return TextDetector(
+    detector = TextDetector(
         model_path=str(model_path),
         input_size=input_size,
         device=device,
     )
+    if model_path.suffix.lower() == ".onnx":
+        try:
+            opencv_net = detector.net.model
+            runtime_net = _OnnxRuntimeNet(model_path, opencv_net)
+            detector.net.model = runtime_net
+            detector.net.uoln = runtime_net.output_names
+            detector.execution_provider = runtime_net.execution_provider
+            detector.backend = f"onnxruntime:{runtime_net.execution_provider}"
+        except Exception:  # noqa: BLE001 - retain the known OpenCV CPU fallback
+            detector.execution_provider = "OpenCV-DNN-CPU"
+    return detector

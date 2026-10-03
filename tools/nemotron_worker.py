@@ -50,7 +50,7 @@ def main() -> None:
         type=str,
         default=None,
         help="Local checkpoint directory (e.g. nemotron-ocr-v2/v2_english). "
-             "If omitted, uses --lang to select a Hub checkpoint.",
+        "If omitted, uses --lang to select a Hub checkpoint.",
     )
     parser.add_argument(
         "--lang",
@@ -110,16 +110,62 @@ def main() -> None:
 
         req_id = req.get("id", "")
 
-        if req_id == "shutdown" or req.get("image_path", "") == "":
+        if req_id == "shutdown" or (
+            not req.get("image_path") and not req.get("image_paths")
+        ):
             _log("Shutdown request received.")
             _respond({"id": req_id, "ok": True, "predictions": []})
             break
 
+        image_paths = req.get("image_paths")
         image_path = req.get("image_path", "")
         merge_level = req.get("merge_level") or default_merge_level
 
+        if image_paths is not None:
+            if not isinstance(image_paths, list) or not all(
+                isinstance(path, str) for path in image_paths
+            ):
+                _respond(
+                    {
+                        "id": req_id,
+                        "ok": False,
+                        "error": "image_paths must be a list of paths",
+                    }
+                )
+                continue
+            missing = [path for path in image_paths if not Path(path).exists()]
+            if missing:
+                _respond(
+                    {
+                        "id": req_id,
+                        "ok": False,
+                        "error": f"image not found: {missing[0]}",
+                    }
+                )
+                continue
+            try:
+                predictions = ocr(image_paths, merge_level=merge_level)
+                safe_predictions = [
+                    [
+                        {
+                            k: (float(v) if isinstance(v, float) else v)
+                            for k, v in pred.items()
+                        }
+                        for pred in (result or [])
+                    ]
+                    for result in predictions
+                ]
+                _respond({"id": req_id, "ok": True, "predictions": safe_predictions})
+            except Exception:  # noqa: BLE001
+                err = traceback.format_exc()
+                _log(f"Batch inference error for {len(image_paths)} images:\n{err}")
+                _respond({"id": req_id, "ok": False, "error": err})
+            continue
+
         if not Path(image_path).exists():
-            _respond({"id": req_id, "ok": False, "error": f"image not found: {image_path}"})
+            _respond(
+                {"id": req_id, "ok": False, "error": f"image not found: {image_path}"}
+            )
             continue
 
         try:
